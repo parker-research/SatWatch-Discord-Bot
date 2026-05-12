@@ -14,7 +14,7 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, TimeZone, Utc};
 use satkit::{Instant as SatInstant, TLE, frametransform, itrfcoord::ITRFCoord, sgp4::sgp4};
-use tracing::debug;
+use tracing::trace;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -36,6 +36,7 @@ pub struct GroundStation {
 
 /// One predicted pass over a ground station.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Pass {
     pub station_name: String,
     /// Acquisition of Signal
@@ -162,7 +163,7 @@ fn look_angles(teme_pos_m: &[f64; 3], t: &SatInstant, gs_itrf: &ITRFCoord) -> (f
     let az_rad = east.atan2(north);
 
     let elev_deg = elev_rad.to_degrees();
-    debug!("elev_deg: {elev_deg} @ {t:?}");
+    trace!("elev_deg: {elev_deg} @ {t:?}");
     let az_deg = az_rad.to_degrees().rem_euclid(360.0);
     (elev_deg, az_deg)
 }
@@ -253,7 +254,7 @@ fn predict_passes_for_station(
     t_end: &SatInstant,
     min_elev_deg: f64,
 ) -> Result<Vec<Pass>> {
-    const STEP: f64 = 30.0;
+    const STEP_TIME_SEC: f64 = 2.0;
 
     let unix_start = t_start.as_unixtime();
     let unix_end = t_end.as_unixtime();
@@ -273,12 +274,12 @@ fn predict_passes_for_station(
                 {
                     passes.push(builder.finish(station_name));
                 }
-                t += STEP;
+                t += STEP_TIME_SEC;
                 continue;
             }
         };
 
-        debug!("t={t:.0} elev={elev:.2}° az={az:.1}°");
+        trace!("t={t:.0} elev={elev:.2}° az={az:.1}°");
 
         match current_pass.as_mut() {
             None if elev >= min_elev_deg => {
@@ -300,7 +301,7 @@ fn predict_passes_for_station(
             None => {} // Below threshold, no pass in progress.
         }
 
-        t += STEP;
+        t += STEP_TIME_SEC;
     }
 
     // Close any pass still open at the end of the window.
@@ -337,7 +338,7 @@ mod tests {
         let passes = find_passes_from(TLE1, TLE2, &[rao()], 72, 5.0, START_UNIX)
             .expect("pass prediction must not error");
 
-        assert_eq!(passes.len(), 15);
+        assert_eq!(passes.len(), 16);
     }
 
     /// Each detected pass must meet basic physical constraints.
