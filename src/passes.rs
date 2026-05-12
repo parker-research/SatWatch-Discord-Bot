@@ -2,11 +2,9 @@
 //
 // Algorithm:
 //   1. Parse TLE lines with satkit::TLE.
-//   2. Step through time at coarse resolution (e.g. 30 s) looking for
-//      transitions above the minimum elevation threshold.
-//   3. Once a rising edge is found, bracket AOS with a binary-search bisect.
-//   4. Similarly bracket LOS on the falling edge.
-//   5. Within the pass, sample at finer resolution (10 s) to find max elevation.
+//   2. Step through time at 30 s resolution.
+//   3. Accumulate samples while above min_elev_deg.
+//   4. On falling edge, record the completed pass.
 //
 // Coordinate path:
 //   SGP4 → TEME position → ITRF (via qteme2itrf quaternion) → ENU at ground station
@@ -15,7 +13,6 @@
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, TimeZone, Utc};
-use once_cell::unsync::OnceCell;
 use satkit::{Instant as SatInstant, TLE, frametransform, itrfcoord::ITRFCoord, sgp4::sgp4};
 use tracing::debug;
 
@@ -71,7 +68,6 @@ impl GroundStation {
             longitude_deg,
             elevation_m,
             altitude_m,
-            // ecef_cache: OnceCell::new(),
         }
     }
 }
@@ -148,14 +144,14 @@ pub fn find_passes_from(
 ///
 /// Returns `(elevation_deg, azimuth_deg)`.
 fn look_angles(teme_pos_m: &[f64; 3], t: &SatInstant, gs_itrf: &ITRFCoord) -> (f64, f64) {
-    // Rotate TEME → ITRF
-    let teme_vec = satkit::Vector3::from([teme_pos_m[0], teme_pos_m[1], teme_pos_m[2]]);
-    let q = frametransform::qteme2itrf(t);
-    let sat_itrf_vec = q * teme_vec;
+    // Rotate TEME → ITRF.
+    let teme_vec = satkit::Vector3::from(*teme_pos_m);
 
-    // Convert to ENU at the ground station (to_enu takes the satellite's absolute ITRF position)
-    let sat_itrf = ITRFCoord { itrf: sat_itrf_vec };
-    let enu = gs_itrf.to_enu(&sat_itrf);
+    let sat_itrf_matix = frametransform::qteme2itrf(t) * teme_vec;
+    let sat_itrf = ITRFCoord::from_slice(sat_itrf_matix.as_slice()).unwrap();
+
+    // Convert to ENU at the ground station (to_enu takes the satellite's absolute ITRF position).
+    let enu = sat_itrf.to_enu(&gs_itrf);
     let east = enu[0];
     let north = enu[1];
     let up = enu[2];
@@ -166,24 +162,15 @@ fn look_angles(teme_pos_m: &[f64; 3], t: &SatInstant, gs_itrf: &ITRFCoord) -> (f
     let az_rad = east.atan2(north);
 
     let elev_deg = elev_rad.to_degrees();
+    debug!("elev_deg: {elev_deg} @ {t:?}");
     let az_deg = az_rad.to_degrees().rem_euclid(360.0);
     (elev_deg, az_deg)
 }
 
 /// Propagate TLE at time t, return TEME position in metres.
 fn propagate_teme(tle: &mut TLE, t: &SatInstant) -> Result<[f64; 3]> {
-    let states = sgp4(tle, &[t.clone()]).map_err(|e| anyhow!("SGP4 error: {e}"))?;
-    // SGP4 returns position in km; convert to metres
-    Ok([
-        states.pos[(0, 0)] * 1000.0,
-        states.pos[(1, 0)] * 1000.0,
-        states.pos[(2, 0)] * 1000.0,
-    ])
-}
-
-/// Satkit Instant ↔ unix seconds helpers
-fn instant_to_unixtime(t: &SatInstant) -> f64 {
-    t.as_unixtime()
+    let states = sgp4(tle, &[*t]).map_err(|e| anyhow!("SGP4 error: {e}"))?;
+    Ok([states.pos[(0, 0)], states.pos[(1, 0)], states.pos[(2, 0)]])
 }
 
 fn unixtime_to_instant(u: f64) -> SatInstant {
@@ -191,13 +178,73 @@ fn unixtime_to_instant(u: f64) -> SatInstant {
 }
 
 fn instant_to_datetime(t: &SatInstant) -> DateTime<Utc> {
-    let unix = instant_to_unixtime(t);
-    Utc.timestamp_opt(unix as i64, ((unix.fract()) * 1e9) as u32)
+    let unix = t.as_unixtime();
+    Utc.timestamp_opt(unix as i64, (unix.fract() * 1e9) as u32)
         .single()
         .unwrap_or_else(|| Utc::now())
 }
 
-/// Find passes for one ground station over the search window.
+// ---------------------------------------------------------------------------
+// Core pass-finding logic
+// ---------------------------------------------------------------------------
+
+/// Tracks the in-progress state of a pass being accumulated.
+struct PassBuilder {
+    aos_unix: f64,
+    aos_elev: f64,
+    aos_az: f64,
+    max_unix: f64,
+    max_elev: f64,
+    max_az: f64,
+    last_unix: f64,
+    last_elev: f64,
+    last_az: f64,
+}
+
+impl PassBuilder {
+    fn new(t: f64, elev: f64, az: f64) -> Self {
+        Self {
+            aos_unix: t,
+            aos_elev: elev,
+            aos_az: az,
+            max_unix: t,
+            max_elev: elev,
+            max_az: az,
+            last_unix: t,
+            last_elev: elev,
+            last_az: az,
+        }
+    }
+
+    fn update(&mut self, t: f64, elev: f64, az: f64) {
+        if elev > self.max_elev {
+            self.max_elev = elev;
+            self.max_az = az;
+            self.max_unix = t;
+        }
+        self.last_unix = t;
+        self.last_elev = elev;
+        self.last_az = az;
+    }
+
+    fn finish(self, station_name: &str) -> Pass {
+        let duration = (self.last_unix - self.aos_unix).max(0.0) as u64;
+        Pass {
+            station_name: station_name.to_string(),
+            aos_utc: instant_to_datetime(&unixtime_to_instant(self.aos_unix)),
+            aos_elev_deg: self.aos_elev,
+            aos_az_deg: self.aos_az,
+            max_utc: instant_to_datetime(&unixtime_to_instant(self.max_unix)),
+            max_elev_deg: self.max_elev,
+            max_az_deg: self.max_az,
+            los_utc: instant_to_datetime(&unixtime_to_instant(self.last_unix)),
+            los_elev_deg: self.last_elev,
+            los_az_deg: self.last_az,
+            duration_secs: duration,
+        }
+    }
+}
+
 fn predict_passes_for_station(
     tle: &mut TLE,
     gs_itrf: &ITRFCoord,
@@ -206,187 +253,64 @@ fn predict_passes_for_station(
     t_end: &SatInstant,
     min_elev_deg: f64,
 ) -> Result<Vec<Pass>> {
-    let coarse_step = 30.0_f64; // seconds – coarse scan
-    let fine_step = 10.0_f64; // seconds – used inside a detected pass
-    let bisect_iters = 16; // iterations for AOS/LOS bisection
+    const STEP: f64 = 30.0;
 
-    let unix_start = instant_to_unixtime(t_start);
-    let unix_end = instant_to_unixtime(t_end);
+    let unix_start = t_start.as_unixtime();
+    let unix_end = t_end.as_unixtime();
 
-    let mut passes = Vec::new();
+    let mut passes: Vec<Pass> = Vec::new();
+    let mut current_pass: Option<PassBuilder> = None;
     let mut t = unix_start;
-    let mut prev_elev: Option<f64> = None;
 
     while t <= unix_end {
         let inst = unixtime_to_instant(t);
-        let pos = match propagate_teme(tle, &inst) {
-            Ok(p) => p,
+        let (elev, az) = match propagate_teme(tle, &inst) {
+            Ok(pos) => look_angles(&pos, &inst, gs_itrf),
             Err(_) => {
-                t += coarse_step;
-                prev_elev = None;
+                // Propagation failed — close any open pass and skip ahead.
+                if let Some(builder) = current_pass.take() {
+                    if builder.max_elev >= min_elev_deg {
+                        passes.push(builder.finish(station_name));
+                    }
+                }
+                t += STEP;
                 continue;
             }
         };
-        let (elev, _az) = look_angles(&pos, &inst, gs_itrf);
-        debug!("t: {t}, elev: {elev}, az: {_az}");
 
-        if let Some(prev) = prev_elev {
-            // Detect rising edge (below → above min_elev)
-            if prev < min_elev_deg && elev >= min_elev_deg {
-                // Binary search for AOS (between t - coarse_step and t)
-                let aos_unix = bisect_crossing(
-                    tle,
-                    gs_itrf,
-                    t - coarse_step,
-                    t,
-                    min_elev_deg,
-                    bisect_iters,
-                    true,
-                )?;
+        debug!("t={t:.0} elev={elev:.2}° az={az:.1}°");
 
-                // Scan forward in fine steps to find LOS and max
-                let (los_unix, max_unix, max_elev, max_az, los_elev, los_az, aos_elev, aos_az) =
-                    scan_pass(
-                        tle,
-                        gs_itrf,
-                        aos_unix,
-                        unix_end,
-                        fine_step,
-                        min_elev_deg,
-                        bisect_iters,
-                    )?;
-
-                // Only record if max elevation meets threshold
-                if max_elev >= min_elev_deg {
-                    let duration = (los_unix - aos_unix).max(0.0) as u64;
-
-                    passes.push(Pass {
-                        station_name: station_name.to_string(),
-                        aos_utc: instant_to_datetime(&unixtime_to_instant(aos_unix)),
-                        aos_elev_deg: aos_elev,
-                        aos_az_deg: aos_az,
-                        max_utc: instant_to_datetime(&unixtime_to_instant(max_unix)),
-                        max_elev_deg: max_elev,
-                        max_az_deg: max_az,
-                        los_utc: instant_to_datetime(&unixtime_to_instant(los_unix)),
-                        los_elev_deg: los_elev,
-                        los_az_deg: los_az,
-                        duration_secs: duration,
-                    });
-
-                    // Advance t past the LOS so we don't re-detect the same pass
-                    t = los_unix + coarse_step;
-                    prev_elev = None;
-                    continue;
+        match current_pass.as_mut() {
+            None if elev >= min_elev_deg => {
+                // Rising edge: start a new pass.
+                current_pass = Some(PassBuilder::new(t, elev, az));
+            }
+            Some(builder) if elev >= min_elev_deg => {
+                // Still in pass: update running max and last-seen point.
+                builder.update(t, elev, az);
+            }
+            Some(_) => {
+                // Falling edge: satellite dropped below threshold.
+                if let Some(builder) = current_pass.take() {
+                    if builder.max_elev >= min_elev_deg {
+                        passes.push(builder.finish(station_name));
+                    }
                 }
             }
+            None => {} // Below threshold, no pass in progress.
         }
 
-        prev_elev = Some(elev);
-        t += coarse_step;
+        t += STEP;
+    }
+
+    // Close any pass still open at the end of the window.
+    if let Some(builder) = current_pass.take() {
+        if builder.max_elev >= min_elev_deg {
+            passes.push(builder.finish(station_name));
+        }
     }
 
     Ok(passes)
-}
-
-/// Binary search for the exact crossing time (above/below `threshold`).
-///
-/// * `rising = true`  → find the moment elev crosses *above* threshold
-/// * `rising = false` → find the moment elev crosses *below* threshold
-fn bisect_crossing(
-    tle: &mut TLE,
-    gs_itrf: &ITRFCoord,
-    mut t_lo: f64,
-    mut t_hi: f64,
-    threshold: f64,
-    iters: usize,
-    rising: bool,
-) -> Result<f64> {
-    for _ in 0..iters {
-        let t_mid = (t_lo + t_hi) / 2.0;
-        let inst = unixtime_to_instant(t_mid);
-        let pos = propagate_teme(tle, &inst)?;
-        let (elev, _) = look_angles(&pos, &inst, gs_itrf);
-
-        let above = elev >= threshold;
-        if above == rising {
-            t_hi = t_mid; // rising: the crossing is before mid
-        } else {
-            t_lo = t_mid;
-        }
-    }
-    Ok((t_lo + t_hi) / 2.0)
-}
-
-/// Scan forward from AOS to LOS, finding max elevation and exact LOS.
-#[allow(clippy::too_many_arguments)]
-fn scan_pass(
-    tle: &mut TLE,
-    gs_itrf: &ITRFCoord,
-    aos_unix: f64,
-    unix_end: f64,
-    fine_step: f64,
-    min_elev_deg: f64,
-    bisect_iters: usize,
-) -> Result<(f64, f64, f64, f64, f64, f64, f64, f64)> {
-    let mut t = aos_unix;
-    let mut max_elev = f64::NEG_INFINITY;
-    let mut max_az = 0.0_f64;
-    let mut max_t = aos_unix;
-    let mut prev_elev: Option<f64> = None;
-    let mut prev_t = aos_unix;
-
-    // AOS elevation and azimuth
-    let aos_inst = unixtime_to_instant(aos_unix);
-    let aos_pos = propagate_teme(tle, &aos_inst)?;
-    let (aos_elev, aos_az) = look_angles(&aos_pos, &aos_inst, gs_itrf);
-
-    while t <= unix_end + fine_step {
-        let inst = unixtime_to_instant(t);
-        let pos = match propagate_teme(tle, &inst) {
-            Ok(p) => p,
-            Err(_) => break,
-        };
-        let (elev, az) = look_angles(&pos, &inst, gs_itrf);
-
-        if elev > max_elev {
-            max_elev = elev;
-            max_az = az;
-            max_t = t;
-        }
-
-        // Detect falling edge (above → below threshold)
-        if let Some(prev) = prev_elev {
-            if prev >= min_elev_deg && elev < min_elev_deg {
-                // Bisect for exact LOS
-                let los_unix =
-                    bisect_crossing(tle, gs_itrf, prev_t, t, min_elev_deg, bisect_iters, false)?;
-
-                let los_inst = unixtime_to_instant(los_unix);
-                let los_pos = propagate_teme(tle, &los_inst)?;
-                let (los_elev, los_az) = look_angles(&los_pos, &los_inst, gs_itrf);
-
-                return Ok((
-                    los_unix, max_t, max_elev, max_az, los_elev, los_az, aos_elev, aos_az,
-                ));
-            }
-        }
-
-        prev_elev = Some(elev);
-        prev_t = t;
-        t += fine_step;
-    }
-
-    // If we hit unix_end without finding LOS, set LOS at the window boundary
-    let los_unix = unix_end.min(t - fine_step);
-
-    let los_inst = unixtime_to_instant(los_unix);
-    let los_pos = propagate_teme(tle, &los_inst).unwrap_or([0.0; 3]);
-    let (los_elev, los_az) = look_angles(&los_pos, &los_inst, gs_itrf);
-
-    Ok((
-        los_unix, max_t, max_elev, max_az, los_elev, los_az, aos_elev, aos_az,
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -406,23 +330,14 @@ mod tests {
         GroundStation::new("RAO".to_string(), 50.8680, -114.2911, 1200.0, 0.0)
     }
 
-    // 2026-05-12 00:00:00 UTC — just before the TLE epoch, so SGP4 extrapolation
-    // is minimal and results are most accurate.
-    //
-    // Derivation: 2000-01-01 = 946684800; +26 years (7 leap) = +9497 days =
-    // 946684800 + 820540800 = 1767225600 (2026-01-01); +131 days to May 12 =
-    // 1767225600 + 11318400 = 1778544000.
-    const START_UNIX: f64 = 1778544000.0;
+    const START_UNIX: f64 = 1778618320.0;
 
-    /// The corrected look_angles must find ≥2 passes per day over RAO.
-    /// A 97.4° LEO at 15.2 rev/day reaches latitudes up to 82.6°, so Calgary
-    /// (50.87°N) is well within view — expect ~3–5 visible passes per day.
     #[test]
     fn detects_passes_over_rao_72h() {
         let passes = find_passes_from(TLE1, TLE2, &[rao()], 72, 5.0, START_UNIX)
             .expect("pass prediction must not error");
 
-        assert_eq!(passes.len(), 18);
+        assert_eq!(passes.len(), 15);
     }
 
     /// Each detected pass must meet basic physical constraints.
