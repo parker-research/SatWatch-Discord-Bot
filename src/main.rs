@@ -80,7 +80,6 @@ fn render_pass_group(
     station: &str,
     passes: &[&Pass],
     min_elev: f64,
-    context: &str,
     char_limit: usize,
 ) -> String {
     const FOOTER_RESERVE: usize = 60;
@@ -91,12 +90,11 @@ fn render_pass_group(
         return format!("{header}No passes above {min_elev:.0}° in the search window.");
     }
 
-    let ctx_suffix = if context.is_empty() {
-        String::new()
-    } else {
-        format!(" — {context}")
-    };
-    let count_line = format!("**{}** pass(es){ctx_suffix}:\n", passes.len());
+    let count_line = format!(
+        "**{}** pass{} above {min_elev:.0}° in the next {CHECK_HOURS}h:\n",
+        passes.len(),
+        if passes.len() != 1 { "es" } else { "" }
+    );
 
     // Group passes by consecutive AOS/LOS intervals, separated by a blank line.
     let mut rendered: Vec<String> = Vec::new();
@@ -503,10 +501,6 @@ async fn handle_passes(ctx: &Context, command: &CommandInteraction) -> Result<()
     .await??;
 
     // ── Build reply ──────────────────────────────────────────────────────────
-    let context = format!(
-        "next {hours}h | min elev {min_elev:.0}° | TLE: {} | {latitude_deg:.4}°, {longitude_deg:.4}°, {elevation_m:.0} m",
-        tle_info.updated,
-    );
     let pass_refs: Vec<&Pass> = passes.iter().collect();
     let reply = render_pass_group(
         &tle_info.name,
@@ -514,7 +508,6 @@ async fn handle_passes(ctx: &Context, command: &CommandInteraction) -> Result<()
         &station_name,
         &pass_refs,
         min_elev,
-        &context,
         2000,
     );
 
@@ -824,8 +817,6 @@ async fn handle_upcoming_passes(ctx: &Context, command: &CommandInteraction) -> 
     }
 
     // ── Build reply ──────────────────────────────────────────────────────────
-    let context = format!("next {CHECK_HOURS}h | min elev {CHECK_MIN_ELEV_DEG:.0}°");
-
     if groups.is_empty() {
         command
             .edit_response(
@@ -849,7 +840,6 @@ async fn handle_upcoming_passes(ctx: &Context, command: &CommandInteraction) -> 
             station,
             &pass_refs,
             CHECK_MIN_ELEV_DEG,
-            &context,
             2000,
         );
         if first {
@@ -988,7 +978,6 @@ async fn run_pass_check(http: &Http, db: &Arc<Database>) -> Result<usize> {
                 station,
                 &pass_refs,
                 CHECK_MIN_ELEV_DEG,
-                &format!("min elev {CHECK_MIN_ELEV_DEG:.0}°"),
                 2000,
             );
             match channel_id
