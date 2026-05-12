@@ -97,9 +97,17 @@ fn render_pass_group(
         format!(" — {context}")
     };
     let count_line = format!("**{}** pass(es){ctx_suffix}:\n", passes.len());
-    let rendered: Vec<String> = passes.iter().map(|p| format_pass_line(p)).collect();
 
-    let mut out = format!("{header}{count_line}");
+    // Group passes by consecutive AOS/LOS intervals, separated by a blank line.
+    let mut rendered: Vec<String> = Vec::new();
+    for (i, pass) in passes.iter().enumerate() {
+        if i > 0 && pass.aos_utc - passes[i - 1].los_utc > chrono::Duration::hours(3) {
+            rendered.push(String::new());
+        }
+        rendered.push(format_pass_line(pass));
+    }
+
+    let mut out = format!("{header}{count_line}\n");
     let mut included = 0;
 
     for line in &rendered {
