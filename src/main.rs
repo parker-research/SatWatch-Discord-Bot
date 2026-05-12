@@ -12,7 +12,8 @@ use anyhow::{Result, anyhow};
 use serenity::all::{
     ChannelId, Command, CommandDataOption, CommandDataOptionValue, CommandInteraction,
     CommandOptionType, CreateCommand, CreateCommandOption, CreateInteractionResponse,
-    CreateInteractionResponseMessage, CreateMessage, EditInteractionResponse, GuildId, Interaction,
+    CreateInteractionResponseFollowup, CreateInteractionResponseMessage, CreateMessage,
+    EditInteractionResponse, GuildId, Interaction,
 };
 use serenity::async_trait;
 use serenity::http::Http;
@@ -51,43 +52,54 @@ impl TypeMapKey for HttpKey {
 // Pass line formatting
 // ---------------------------------------------------------------------------
 
-/// Render one pass as a single Discord prose line using localised timestamps.
+/// Render one pass as a single Discord prose line (timing + elevation only).
 ///
-/// Format:
-///   AOS <t:AOS:f> → LOS <t:LOS:t>  (Peak <t:MAX:t> at El 38.4°, >5° for 14m02s)  FrontierSat @ Calgary
-///
-/// Discord renders `<t:UNIX:f>` as a localised date+time and `<t:UNIX:t>` as
-/// a localised time-only value, both in the viewer's own timezone.
-fn format_pass_line(name: &str, p: &Pass, min_elev: f64) -> String {
+/// Discord renders `<t:UNIX:f>` as localised date+time and `<t:UNIX:t>` as
+/// time-only, both in the viewer's own timezone.
+fn format_pass_line(p: &Pass) -> String {
     format!(
         "AOS <t:{aos}:f> → LOS <t:{los}:t>  \
-         (Peak <t:{max}:t> at El {elev:.1}°, >{min_elev:.0}° for {dur_m}m{dur_s:02}s)  \
-         {name} @ {station}",
+         ({dur_m}m{dur_s:02}s, Peak El {elev:.1}° at <t:{max}:t>)",
         aos = p.aos_utc.timestamp(),
         los = p.los_utc.timestamp(),
         max = p.max_utc.timestamp(),
         elev = p.max_elev_deg,
         dur_m = p.duration_secs / 60,
         dur_s = p.duration_secs % 60,
-        station = p.station_name,
     )
 }
 
-/// Render a list of passes as newline-separated prose lines, truncating with a
-/// "…N more" footer if `char_limit` would be exceeded.
-fn render_pass_lines(
-    passes: &[(/*name*/ &str, &Pass)],
+/// Render all passes for one satellite × ground-station pair as a single Discord
+/// message block.  The group header (`🛰️ Sat @ Station`) is printed once at the
+/// top; pass lines below carry only timing/elevation.  `context`, if non-empty,
+/// is appended to the pass-count line (e.g. "next 24h | min elev 5°").
+/// Truncates with a "…N more" footer if `char_limit` would be exceeded.
+fn render_pass_group(
+    name: &str,
+    norad_id: u64,
+    station: &str,
+    passes: &[&Pass],
     min_elev: f64,
+    context: &str,
     char_limit: usize,
 ) -> String {
     const FOOTER_RESERVE: usize = 60;
 
-    let rendered: Vec<String> = passes
-        .iter()
-        .map(|(name, p)| format_pass_line(name, p, min_elev))
-        .collect();
+    let header = format!("🛰️ **{name}** (NORAD {norad_id}) @ **{station}**\n");
 
-    let mut out = String::new();
+    if passes.is_empty() {
+        return format!("{header}No passes above {min_elev:.0}° in the search window.");
+    }
+
+    let ctx_suffix = if context.is_empty() {
+        String::new()
+    } else {
+        format!(" — {context}")
+    };
+    let count_line = format!("**{}** pass(es){ctx_suffix}:\n", passes.len());
+    let rendered: Vec<String> = passes.iter().map(|p| format_pass_line(p)).collect();
+
+    let mut out = format!("{header}{count_line}");
     let mut included = 0;
 
     for line in &rendered {
@@ -483,23 +495,20 @@ async fn handle_passes(ctx: &Context, command: &CommandInteraction) -> Result<()
     .await??;
 
     // ── Build reply ──────────────────────────────────────────────────────────
-    let mut reply = format!(
-        "🛰️ **{}** (NORAD {norad_id})\n\
-         📡 **{station_name}** ({latitude_deg:.4}°, {longitude_deg:.4}°, {elevation_m:.0} m)\n\
-         🕐 Next **{hours}h** | min elev **{min_elev:.0}°** | TLE updated: {}\n\n",
-        tle_info.name, tle_info.updated,
+    let context = format!(
+        "next {hours}h | min elev {min_elev:.0}° | TLE: {} | {latitude_deg:.4}°, {longitude_deg:.4}°, {elevation_m:.0} m",
+        tle_info.updated,
     );
-
-    if passes.is_empty() {
-        reply.push_str("No passes above the minimum elevation threshold in the search window.");
-    } else {
-        reply.push_str(&format!("**{}** pass(es) found:\n", passes.len()));
-        let pairs: Vec<(&str, &Pass)> =
-            passes.iter().map(|p| (tle_info.name.as_str(), p)).collect();
-        // Discord limit is 2000 chars; the prose header above is ~200, leaving
-        // ~1800 for the pass lines.
-        reply.push_str(&render_pass_lines(&pairs, min_elev, 1800));
-    }
+    let pass_refs: Vec<&Pass> = passes.iter().collect();
+    let reply = render_pass_group(
+        &tle_info.name,
+        norad_id,
+        &station_name,
+        &pass_refs,
+        min_elev,
+        &context,
+        2000,
+    );
 
     command
         .edit_response(&ctx.http, EditInteractionResponse::new().content(&reply))
@@ -794,32 +803,63 @@ async fn handle_upcoming_passes(ctx: &Context, command: &CommandInteraction) -> 
     // Sort all passes chronologically by AOS across all satellites and stations.
     all_passes.sort_by_key(|(_, _, p)| p.aos_utc);
 
-    // ── Build reply ──────────────────────────────────────────────────────────
-    let mut reply = format!(
-        "🔭 **Upcoming passes** — next **{CHECK_HOURS}h** | min elev **{CHECK_MIN_ELEV_DEG:.0}°**\n\
-         {} satellite(s) × {} station(s) — **{}** pass(es) found\n\n",
-        satellites.len(),
-        stations.len(),
-        all_passes.len(),
-    );
-
-    if all_passes.is_empty() {
-        reply.push_str(&format!(
-            "No passes above {CHECK_MIN_ELEV_DEG:.0}° found in the next \
-             {CHECK_HOURS}h for any tracked satellite / saved station combination."
-        ));
-    } else {
-        let pairs: Vec<(&str, &Pass)> = all_passes
+    // Group by (sat_name, norad_id, station_name), preserving AOS order within each group.
+    let mut groups: Vec<(String, u64, String, Vec<usize>)> = Vec::new();
+    for (i, (name, norad_id, pass)) in all_passes.iter().enumerate() {
+        match groups
             .iter()
-            .map(|(name, _norad_id, p)| (name.as_str(), p))
-            .collect();
-        // The prose header above is ~150 chars; leave the rest for the pass lines.
-        reply.push_str(&render_pass_lines(&pairs, CHECK_MIN_ELEV_DEG, 1850));
+            .position(|(n, nid, s, _)| n == name && nid == norad_id && s == &pass.station_name)
+        {
+            Some(idx) => groups[idx].3.push(i),
+            None => groups.push((name.clone(), *norad_id, pass.station_name.clone(), vec![i])),
+        }
     }
 
-    command
-        .edit_response(&ctx.http, EditInteractionResponse::new().content(&reply))
-        .await?;
+    // ── Build reply ──────────────────────────────────────────────────────────
+    let context = format!("next {CHECK_HOURS}h | min elev {CHECK_MIN_ELEV_DEG:.0}°");
+
+    if groups.is_empty() {
+        command
+            .edit_response(
+                &ctx.http,
+                EditInteractionResponse::new().content(format!(
+                    "No passes above {CHECK_MIN_ELEV_DEG:.0}° found in the next \
+                     {CHECK_HOURS}h for any tracked satellite / saved station combination."
+                )),
+            )
+            .await?;
+        return Ok(());
+    }
+
+    // Edit the deferred reply with the first group; follow-up for the rest.
+    let mut first = true;
+    for (name, norad_id, station, indices) in &groups {
+        let pass_refs: Vec<&Pass> = indices.iter().map(|&i| &all_passes[i].2).collect();
+        let msg = render_pass_group(
+            name,
+            *norad_id,
+            station,
+            &pass_refs,
+            CHECK_MIN_ELEV_DEG,
+            &context,
+            2000,
+        );
+        if first {
+            command
+                .edit_response(&ctx.http, EditInteractionResponse::new().content(&msg))
+                .await?;
+            first = false;
+        } else {
+            command
+                .create_followup(
+                    &ctx.http,
+                    CreateInteractionResponseFollowup::new().content(msg),
+                )
+                .await?;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+
     Ok(())
 }
 
@@ -910,11 +950,11 @@ async fn run_pass_check(http: &Http, db: &Arc<Database>) -> Result<usize> {
             }
         };
 
-        // Announce each pass that hasn't been seen before.
-        for pass in &passes {
+        // Collect unnotified passes grouped by station.
+        let mut new_by_station: Vec<(String, Vec<usize>)> = Vec::new();
+        for (i, pass) in passes.iter().enumerate() {
             let aos_unix = pass.aos_utc.timestamp();
             let station = pass.station_name.clone();
-
             let already_notified = {
                 let db2 = db.clone();
                 let station2 = station.clone();
@@ -923,30 +963,46 @@ async fn run_pass_check(http: &Http, db: &Arc<Database>) -> Result<usize> {
                 })
                 .await??
             };
-
-            if already_notified {
-                continue;
+            if !already_notified {
+                match new_by_station.iter().position(|(s, _)| s == &station) {
+                    Some(idx) => new_by_station[idx].1.push(i),
+                    None => new_by_station.push((station, vec![i])),
+                }
             }
+        }
 
-            let msg = format_pass_notification(norad_id, &display_name, pass);
+        // Send one message per sat×station group.
+        for (station, indices) in &new_by_station {
+            let pass_refs: Vec<&Pass> = indices.iter().map(|&i| &passes[i]).collect();
+            let msg = render_pass_group(
+                &display_name,
+                norad_id,
+                station,
+                &pass_refs,
+                CHECK_MIN_ELEV_DEG,
+                &format!("min elev {CHECK_MIN_ELEV_DEG:.0}°"),
+                2000,
+            );
             match channel_id
                 .send_message(http, CreateMessage::new().content(msg))
                 .await
             {
                 Ok(_) => {
-                    let db2 = db.clone();
-                    let station2 = station.clone();
-                    tokio::task::spawn_blocking(move || {
-                        db2.mark_pass_notified(norad_id, &station2, aos_unix)
-                    })
-                    .await??;
-                    announced += 1;
+                    for &i in indices {
+                        let db2 = db.clone();
+                        let station2 = station.clone();
+                        let aos_unix = passes[i].aos_utc.timestamp();
+                        tokio::task::spawn_blocking(move || {
+                            db2.mark_pass_notified(norad_id, &station2, aos_unix)
+                        })
+                        .await??;
+                    }
+                    announced += indices.len();
                 }
                 Err(e) => {
                     error!("Failed to send pass notification: {e:#}");
                 }
             }
-
             // Be polite to Discord's rate limiter between messages.
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -956,17 +1012,6 @@ async fn run_pass_check(http: &Http, db: &Arc<Database>) -> Result<usize> {
     }
 
     Ok(announced)
-}
-
-/// Format one pass as a Discord notification message.
-///
-/// Uses the same localised-timestamp prose line as the slash command handlers
-/// so the format is consistent everywhere.
-fn format_pass_notification(norad_id: u64, name: &str, p: &Pass) -> String {
-    format!(
-        "🛰️ **{name}** (NORAD {norad_id})\n{}",
-        format_pass_line(name, p, CHECK_MIN_ELEV_DEG),
-    )
 }
 
 // ---------------------------------------------------------------------------
