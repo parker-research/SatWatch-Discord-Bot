@@ -89,7 +89,7 @@ impl EventHandler for Handler {
                 "station" => handle_station(&ctx, &command).await,
                 "satellite" => handle_satellite(&ctx, &command).await,
                 "set-notify-channel" => handle_set_notify_channel(&ctx, &command).await,
-                "check" => handle_check(&ctx, &command).await,
+                "upcoming-passes" => handle_upcoming_passes(&ctx, &command).await,
                 _ => {
                     send_reply(&ctx, &command, "❓ Unknown command.").await;
                     return;
@@ -289,10 +289,10 @@ fn build_commands() -> Vec<CreateCommand> {
             .description(
                 "Set this channel as the destination for automatic pass notifications",
             ),
-        // /check – manually trigger the background pass check now
-        CreateCommand::new("check")
+        // /upcoming-passes – show all passes for tracked sats × saved stations
+        CreateCommand::new("upcoming-passes")
             .description(
-                "Immediately check for upcoming passes and send any new notifications",
+                "Show upcoming passes for all tracked satellites over all saved stations",
             ),
     ]
 }
@@ -634,10 +634,10 @@ async fn handle_set_notify_channel(ctx: &Context, command: &CommandInteraction) 
 }
 
 // ---------------------------------------------------------------------------
-// /check handler
+// /upcoming-passes handler
 // ---------------------------------------------------------------------------
 
-async fn handle_check(ctx: &Context, command: &CommandInteraction) -> Result<()> {
+async fn handle_upcoming_passes(ctx: &Context, command: &CommandInteraction) -> Result<()> {
     command
         .create_response(
             &ctx.http,
@@ -647,35 +647,132 @@ async fn handle_check(ctx: &Context, command: &CommandInteraction) -> Result<()>
 
     let db = get_db(ctx).await;
 
-    // Give the user a clear message if the channel hasn't been configured yet.
-    let channel_set = {
+    let (stations, satellites) = {
         let db2 = db.clone();
-        tokio::task::spawn_blocking(move || db2.get_setting("notify_channel_id")).await??
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            Ok((db2.list_stations()?, db2.list_satellites()?))
+        })
+        .await??
     };
-    if channel_set.is_none() {
+
+    if stations.is_empty() {
         command
             .edit_response(
                 &ctx.http,
-                EditInteractionResponse::new().content(
-                    "⚠️ No notification channel configured. \
-                     Run `/set-notify-channel` in the desired channel first.",
-                ),
+                EditInteractionResponse::new()
+                    .content("No ground stations configured. Use `/station add` to add one."),
+            )
+            .await?;
+        return Ok(());
+    }
+    if satellites.is_empty() {
+        command
+            .edit_response(
+                &ctx.http,
+                EditInteractionResponse::new()
+                    .content("No satellites tracked. Use `/satellite add` to add one."),
             )
             .await?;
         return Ok(());
     }
 
-    let reply = match run_pass_check(&ctx.http, &db).await {
-        Ok(0) => "✅ Check complete — no new passes to announce \
-                   (all upcoming passes have already been notified, \
-                   or no stations/satellites are configured)."
-            .to_string(),
-        Ok(n) => format!("✅ Check complete — announced **{n}** new upcoming pass(es)."),
-        Err(e) => format!("⚠️ Check failed: {e}"),
-    };
+    // Fetch TLEs and compute passes for every satellite, then merge and sort.
+    // Does NOT touch the notified_passes table.
+    let mut all_passes: Vec<(String, u64, Pass)> = Vec::new();
+
+    for sat in &satellites {
+        let tle = match satnogs::fetch_tle(sat.norad_id).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Failed to fetch TLE for NORAD {}: {e:#}", sat.norad_id);
+                continue;
+            }
+        };
+
+        let display_name = sat.label.as_deref().unwrap_or(&tle.name).to_string();
+        let norad_id = sat.norad_id;
+        let tle2 = tle.clone();
+        let stations2 = stations.clone();
+
+        let passes = match tokio::task::spawn_blocking(move || {
+            find_passes(&tle2.line1, &tle2.line2, &stations2, CHECK_HOURS, CHECK_MIN_ELEV_DEG)
+        })
+        .await
+        {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                warn!("Pass computation failed for NORAD {norad_id}: {e:#}");
+                continue;
+            }
+            Err(e) => {
+                warn!("spawn_blocking panicked for NORAD {norad_id}: {e:#}");
+                continue;
+            }
+        };
+
+        for pass in passes {
+            all_passes.push((display_name.clone(), norad_id, pass));
+        }
+    }
+
+    if all_passes.is_empty() {
+        command
+            .edit_response(
+                &ctx.http,
+                EditInteractionResponse::new().content(format!(
+                    "No passes above {CHECK_MIN_ELEV_DEG:.0}° found in the next \
+                     {CHECK_HOURS}h for any tracked satellite / saved station combination."
+                )),
+            )
+            .await?;
+        return Ok(());
+    }
+
+    // Sort all passes by AOS time across all satellites and stations.
+    all_passes.sort_by_key(|(_, _, p)| p.aos_utc);
+
+    let mut reply = format!(
+        "🔭 **Upcoming passes** — next **{CHECK_HOURS}h** | min elev **{CHECK_MIN_ELEV_DEG:.0}°**\n\
+         {} satellite(s) × {} station(s) — **{}** pass(es) found\n\n",
+        satellites.len(),
+        stations.len(),
+        all_passes.len(),
+    );
+
+    for (i, (name, norad_id, p)) in all_passes.iter().enumerate() {
+        reply.push_str(&format!(
+            "**Pass {}** — 🛰️ **{name}** (NORAD {norad_id}) over **{}** on {}\n\
+             • AOS: {} (elev {:.1}°, az {:.0}°)\n\
+             • MAX: {} (elev **{:.1}°**, az {:.0}°)\n\
+             • LOS: {} (elev {:.1}°, az {:.0}°)\n\
+             • Duration: **{}m {}s**\n\n",
+            i + 1,
+            p.station_name,
+            p.aos_utc.format("%Y-%m-%d"),
+            p.aos_utc.format("%H:%M:%S UTC"),
+            p.aos_elev_deg,
+            p.aos_az_deg,
+            p.max_utc.format("%H:%M:%S UTC"),
+            p.max_elev_deg,
+            p.max_az_deg,
+            p.los_utc.format("%H:%M:%S UTC"),
+            p.los_elev_deg,
+            p.los_az_deg,
+            p.duration_secs / 60,
+            p.duration_secs % 60,
+        ));
+
+        if reply.len() > 1700 && i + 1 < all_passes.len() {
+            reply.push_str(&format!(
+                "*…and {} more pass(es). Use `/passes` with a narrower window to see more.*",
+                all_passes.len() - i - 1
+            ));
+            break;
+        }
+    }
 
     command
-        .edit_response(&ctx.http, EditInteractionResponse::new().content(reply))
+        .edit_response(&ctx.http, EditInteractionResponse::new().content(&reply))
         .await?;
     Ok(())
 }
