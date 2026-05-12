@@ -254,7 +254,7 @@ fn predict_passes_for_station(
     t_end: &SatInstant,
     min_elev_deg: f64,
 ) -> Result<Vec<Pass>> {
-    const STEP_TIME_SEC: f64 = 2.0;
+    const STEP_TIME_SEC: f64 = 1.0;
 
     let unix_start = t_start.as_unixtime();
     let unix_end = t_end.as_unixtime();
