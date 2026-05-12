@@ -132,7 +132,7 @@ pub fn find_passes_from(
         all_passes.append(&mut passes);
     }
 
-    all_passes.sort_by(|a, b| a.aos_utc.cmp(&b.aos_utc));
+    all_passes.sort_by_key(|a| a.aos_utc);
     Ok(all_passes)
 }
 
@@ -151,7 +151,7 @@ fn look_angles(teme_pos_m: &[f64; 3], t: &SatInstant, gs_itrf: &ITRFCoord) -> (f
     let sat_itrf = ITRFCoord::from_slice(sat_itrf_matix.as_slice()).unwrap();
 
     // Convert to ENU at the ground station (to_enu takes the satellite's absolute ITRF position).
-    let enu = sat_itrf.to_enu(&gs_itrf);
+    let enu = sat_itrf.to_enu(gs_itrf);
     let east = enu[0];
     let north = enu[1];
     let up = enu[2];
@@ -181,7 +181,7 @@ fn instant_to_datetime(t: &SatInstant) -> DateTime<Utc> {
     let unix = t.as_unixtime();
     Utc.timestamp_opt(unix as i64, (unix.fract() * 1e9) as u32)
         .single()
-        .unwrap_or_else(|| Utc::now())
+        .unwrap_or_else(Utc::now)
 }
 
 // ---------------------------------------------------------------------------
@@ -268,10 +268,10 @@ fn predict_passes_for_station(
             Ok(pos) => look_angles(&pos, &inst, gs_itrf),
             Err(_) => {
                 // Propagation failed — close any open pass and skip ahead.
-                if let Some(builder) = current_pass.take() {
-                    if builder.max_elev >= min_elev_deg {
-                        passes.push(builder.finish(station_name));
-                    }
+                if let Some(builder) = current_pass.take()
+                    && builder.max_elev >= min_elev_deg
+                {
+                    passes.push(builder.finish(station_name));
                 }
                 t += STEP;
                 continue;
@@ -291,10 +291,10 @@ fn predict_passes_for_station(
             }
             Some(_) => {
                 // Falling edge: satellite dropped below threshold.
-                if let Some(builder) = current_pass.take() {
-                    if builder.max_elev >= min_elev_deg {
-                        passes.push(builder.finish(station_name));
-                    }
+                if let Some(builder) = current_pass.take()
+                    && builder.max_elev >= min_elev_deg
+                {
+                    passes.push(builder.finish(station_name));
                 }
             }
             None => {} // Below threshold, no pass in progress.
@@ -304,10 +304,10 @@ fn predict_passes_for_station(
     }
 
     // Close any pass still open at the end of the window.
-    if let Some(builder) = current_pass.take() {
-        if builder.max_elev >= min_elev_deg {
-            passes.push(builder.finish(station_name));
-        }
+    if let Some(builder) = current_pass.take()
+        && builder.max_elev >= min_elev_deg
+    {
+        passes.push(builder.finish(station_name));
     }
 
     Ok(passes)
