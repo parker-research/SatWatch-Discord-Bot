@@ -19,14 +19,14 @@ Predict upcoming satellite passes over a ground station.
 | `norad_id` | ✅ | NORAD catalog number (e.g. `69015` for FrontierSat) |
 | `lat` | ✅ | Ground station latitude in decimal degrees |
 | `lon` | ✅ | Ground station longitude in decimal degrees |
-| `alt_m` | ❌ | Altitude above ellipsoid in metres (default 0) |
+| `elevation_m` | ❌ | Altitude above ellipsoid in metres (default 0) |
 | `hours` | ❌ | Search window in hours, 1–72 (default 24) |
 | `min_elev` | ❌ | Minimum peak elevation to report in degrees (default 5) |
 | `station_name` | ❌ | Label for the station (default: coords) |
 
 **Example:**
 ```
-/passes norad_id:69015 lat:51.0447 lon:-114.0719 alt_m:1045 station_name:Calgary hours:24 min_elev:10
+/passes norad_id:69015 lat:51.0447 lon:-114.0719 elevation_m:1045 station_name:Calgary hours:24 min_elev:10
 ```
 
 ### `/tle`

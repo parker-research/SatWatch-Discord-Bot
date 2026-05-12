@@ -5,8 +5,10 @@ mod db;
 mod passes;
 mod satnogs;
 
-use anyhow::{anyhow, Result};
 use db::Database;
+use passes::{GroundStation, Pass, find_passes};
+
+use anyhow::{Result, anyhow};
 use serenity::all::{
     ChannelId, Command, CommandDataOption, CommandDataOptionValue, CommandInteraction,
     CommandOptionType, CreateCommand, CreateCommandOption, CreateInteractionResponse,
@@ -21,13 +23,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
-use passes::{find_passes, GroundStation, Pass};
-
-// Minimum elevation used by the background pass checker.
+/// Minimum elevation used by the background pass checker.
 const CHECK_MIN_ELEV_DEG: f64 = 5.0;
-// Search window for the background pass checker.
+
+/// Search window for the background pass checker.
 const CHECK_HOURS: u64 = 72;
-// How long to keep notified-pass records before pruning them.
+
+/// How long to keep notified-pass records before pruning them.
 const NOTIFIED_PASS_TTL_DAYS: i64 = 7;
 
 // ---------------------------------------------------------------------------
@@ -66,8 +68,11 @@ impl EventHandler for Handler {
         // Guild-scoped is instant; global can take up to 1 hour to propagate.
         // Set DISCORD_GUILD_ID in .env for fast testing, leave unset for global.
         if let Ok(guild_id_str) = env::var("DISCORD_GUILD_ID") {
-            let guild_id =
-                GuildId::new(guild_id_str.parse().expect("DISCORD_GUILD_ID must be a u64"));
+            let guild_id = GuildId::new(
+                guild_id_str
+                    .parse()
+                    .expect("DISCORD_GUILD_ID must be a u64"),
+            );
             guild_id
                 .set_commands(&ctx.http, build_commands())
                 .await
@@ -140,7 +145,7 @@ fn build_commands() -> Vec<CreateCommand> {
             .add_option(
                 CreateCommandOption::new(
                     CommandOptionType::Number,
-                    "alt_m",
+                    "elevation_m",
                     "Ground station altitude in metres above ellipsoid (default 0)",
                 )
                 .required(false),
@@ -212,10 +217,18 @@ fn build_commands() -> Vec<CreateCommand> {
                 .add_sub_option(
                     CreateCommandOption::new(
                         CommandOptionType::Number,
-                        "alt_m",
-                        "Altitude above ellipsoid in metres (default 0)",
+                        "elevation_m",
+                        "Ground elevation above ellipsoid in metres",
                     )
-                    .required(false),
+                    .required(true),
+                )
+                .add_sub_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::Number,
+                        "altitude_m",
+                        "Height above ground in metres",
+                    )
+                    .required(true),
                 ),
             )
             .add_option(
@@ -286,14 +299,10 @@ fn build_commands() -> Vec<CreateCommand> {
             )),
         // /set-notify-channel – configure where pass alerts go
         CreateCommand::new("set-notify-channel")
-            .description(
-                "Set this channel as the destination for automatic pass notifications",
-            ),
+            .description("Set this channel as the destination for automatic pass notifications"),
         // /upcoming-passes – show all passes for tracked sats × saved stations
         CreateCommand::new("upcoming-passes")
-            .description(
-                "Show upcoming passes for all tracked satellites over all saved stations",
-            ),
+            .description("Show upcoming passes for all tracked satellites over all saved stations"),
     ]
 }
 
@@ -356,13 +365,14 @@ async fn handle_tle(ctx: &Context, command: &CommandInteraction) -> Result<()> {
 
 async fn handle_passes(ctx: &Context, command: &CommandInteraction) -> Result<()> {
     let norad_id = get_option_i64(command, "norad_id").unwrap_or(0) as u64;
-    let lat = get_option_f64(command, "lat").unwrap_or(0.0);
-    let lon = get_option_f64(command, "lon").unwrap_or(0.0);
-    let alt_m = get_option_f64(command, "alt_m").unwrap_or(0.0);
+    let latitude_deg = get_option_f64(command, "lat").unwrap_or(0.0);
+    let longitude_deg = get_option_f64(command, "lon").unwrap_or(0.0);
+    let elevation_m = get_option_f64(command, "elevation_m").unwrap_or(0.0);
+    let altitude_m = get_option_f64(command, "altitude_m").unwrap_or(0.0);
     let hours = get_option_i64(command, "hours").unwrap_or(24).clamp(1, 72) as u64;
     let min_elev = get_option_f64(command, "min_elev").unwrap_or(5.0);
     let station_name = get_option_str(command, "station_name")
-        .unwrap_or_else(|| format!("{lat:.2}°N, {lon:.2}°E"));
+        .unwrap_or_else(|| format!("{latitude_deg:.2}°N, {longitude_deg:.2}°E"));
 
     // Defer immediately — orbit propagation + HTTP fetch may take a second
     command
@@ -387,20 +397,32 @@ async fn handle_passes(ctx: &Context, command: &CommandInteraction) -> Result<()
         }
     };
 
-    let gs = GroundStation { name: station_name.clone(), lat_deg: lat, lon_deg: lon, alt_m };
+    let gs = GroundStation::new(
+        station_name.clone(),
+        latitude_deg,
+        longitude_deg,
+        elevation_m,
+        altitude_m,
+    );
 
     // Run pass prediction (sync, but fast enough for tokio::task::spawn_blocking)
     let tle_clone = tle_info.clone();
     let gs_clone = gs.clone();
     let passes = tokio::task::spawn_blocking(move || {
-        find_passes(&tle_clone.line1, &tle_clone.line2, &[gs_clone], hours, min_elev)
+        find_passes(
+            &tle_clone.line1,
+            &tle_clone.line2,
+            &[gs_clone],
+            hours,
+            min_elev,
+        )
     })
     .await??;
 
     // Build reply
     let mut reply = format!(
         "🛰️ **{}** (NORAD {norad_id})\n\
-         📡 Station: **{}** ({lat:.4}°, {lon:.4}°, {alt_m:.0} m)\n\
+         📡 Station: **{}** ({latitude_deg:.4}°, {longitude_deg:.4}°, {elevation_m:.0} m)\n\
          🕐 Next **{hours}h** | min elevation **{min_elev:.0}°**\n\
          TLE updated: {}\n\n",
         tle_info.name, station_name, tle_info.updated
@@ -464,22 +486,27 @@ async fn handle_station(ctx: &Context, command: &CommandInteraction) -> Result<(
         "add" => {
             let name = get_sub_str(&opts, "name")
                 .ok_or_else(|| anyhow!("Missing required option: name"))?;
-            let lat = get_sub_f64(&opts, "lat")
-                .ok_or_else(|| anyhow!("Missing required option: lat"))?;
-            let lon = get_sub_f64(&opts, "lon")
-                .ok_or_else(|| anyhow!("Missing required option: lon"))?;
-            let alt_m = get_sub_f64(&opts, "alt_m").unwrap_or(0.0);
+            let lat =
+                get_sub_f64(&opts, "lat").ok_or_else(|| anyhow!("Missing required option: lat"))?;
+            let lon =
+                get_sub_f64(&opts, "lon").ok_or_else(|| anyhow!("Missing required option: lon"))?;
+            let elevation_m = get_sub_f64(&opts, "elevation_m")
+                .ok_or_else(|| anyhow!("Missing required option: elevation_m"))?;
+            let altitude_m = get_sub_f64(&opts, "altitude_m")
+                .ok_or_else(|| anyhow!("Missing required option: altitude_m"))?;
 
             let name2 = name.clone();
-            match tokio::task::spawn_blocking(move || db.add_station(&name2, lat, lon, alt_m))
-                .await?
+            match tokio::task::spawn_blocking(move || {
+                db.add_station(&name2, lat, lon, elevation_m, altitude_m)
+            })
+            .await?
             {
                 Ok(()) => {
                     send_reply(
                         ctx,
                         command,
                         &format!(
-                            "✅ Saved station **{name}** ({lat:.4}°, {lon:.4}°, {alt_m:.0} m)."
+                            "✅ Saved station **{name}** ({lat:.4}°, {lon:.4}°, {elevation_m:.0} m)."
                         ),
                     )
                     .await;
@@ -500,7 +527,12 @@ async fn handle_station(ctx: &Context, command: &CommandInteraction) -> Result<(
             if removed {
                 send_reply(ctx, command, &format!("✅ Removed station **{name}**.")).await;
             } else {
-                send_reply(ctx, command, &format!("❌ No station named **{name}** found.")).await;
+                send_reply(
+                    ctx,
+                    command,
+                    &format!("❌ No station named **{name}** found."),
+                )
+                .await;
             }
         }
 
@@ -519,7 +551,7 @@ async fn handle_station(ctx: &Context, command: &CommandInteraction) -> Result<(
                 for s in &stations {
                     msg.push_str(&format!(
                         "• **{}** — {:.4}°, {:.4}°, {:.0} m\n",
-                        s.name, s.lat_deg, s.lon_deg, s.alt_m
+                        s.name, s.latitude_deg, s.longitude_deg, s.altitude_m
                     ));
                 }
                 send_reply(ctx, command, &msg).await;
@@ -576,8 +608,12 @@ async fn handle_satellite(ctx: &Context, command: &CommandInteraction) -> Result
                 tokio::task::spawn_blocking(move || db.remove_satellite(norad_id)).await??;
 
             if removed {
-                send_reply(ctx, command, &format!("✅ Stopped tracking NORAD **{norad_id}**."))
-                    .await;
+                send_reply(
+                    ctx,
+                    command,
+                    &format!("✅ Stopped tracking NORAD **{norad_id}**."),
+                )
+                .await;
             } else {
                 send_reply(
                     ctx,
@@ -695,7 +731,13 @@ async fn handle_upcoming_passes(ctx: &Context, command: &CommandInteraction) -> 
         let stations2 = stations.clone();
 
         let passes = match tokio::task::spawn_blocking(move || {
-            find_passes(&tle2.line1, &tle2.line2, &stations2, CHECK_HOURS, CHECK_MIN_ELEV_DEG)
+            find_passes(
+                &tle2.line1,
+                &tle2.line2,
+                &stations2,
+                CHECK_HOURS,
+                CHECK_MIN_ELEV_DEG,
+            )
         })
         .await
         {
@@ -792,8 +834,8 @@ async fn run_pass_check(http: &Http, db: &Arc<Database>) -> Result<usize> {
     // Resolve the notification channel.
     let channel_id = {
         let db2 = db.clone();
-        let raw = tokio::task::spawn_blocking(move || db2.get_setting("notify_channel_id"))
-            .await??;
+        let raw =
+            tokio::task::spawn_blocking(move || db2.get_setting("notify_channel_id")).await??;
         match raw {
             Some(s) => ChannelId::new(s.parse::<u64>()?),
             None => return Ok(0),
@@ -843,7 +885,13 @@ async fn run_pass_check(http: &Http, db: &Arc<Database>) -> Result<usize> {
         let stations2 = stations.clone();
         let norad_id = sat.norad_id;
         let passes = match tokio::task::spawn_blocking(move || {
-            find_passes(&tle2.line1, &tle2.line2, &stations2, CHECK_HOURS, CHECK_MIN_ELEV_DEG)
+            find_passes(
+                &tle2.line1,
+                &tle2.line2,
+                &stations2,
+                CHECK_HOURS,
+                CHECK_MIN_ELEV_DEG,
+            )
         })
         .await
         {
@@ -877,7 +925,10 @@ async fn run_pass_check(http: &Http, db: &Arc<Database>) -> Result<usize> {
             }
 
             let msg = format_pass_notification(norad_id, &display_name, pass);
-            match channel_id.send_message(http, CreateMessage::new().content(msg)).await {
+            match channel_id
+                .send_message(http, CreateMessage::new().content(msg))
+                .await
+            {
                 Ok(_) => {
                     let db2 = db.clone();
                     let station2 = station.clone();
@@ -957,19 +1008,31 @@ fn get_subcommand(cmd: &CommandInteraction) -> Result<(String, Vec<CommandDataOp
 
 fn get_sub_i64(opts: &[CommandDataOption], name: &str) -> Option<i64> {
     opts.iter().find(|o| o.name == name).and_then(|o| {
-        if let CommandDataOptionValue::Integer(v) = &o.value { Some(*v) } else { None }
+        if let CommandDataOptionValue::Integer(v) = &o.value {
+            Some(*v)
+        } else {
+            None
+        }
     })
 }
 
 fn get_sub_f64(opts: &[CommandDataOption], name: &str) -> Option<f64> {
     opts.iter().find(|o| o.name == name).and_then(|o| {
-        if let CommandDataOptionValue::Number(v) = &o.value { Some(*v) } else { None }
+        if let CommandDataOptionValue::Number(v) = &o.value {
+            Some(*v)
+        } else {
+            None
+        }
     })
 }
 
 fn get_sub_str(opts: &[CommandDataOption], name: &str) -> Option<String> {
     opts.iter().find(|o| o.name == name).and_then(|o| {
-        if let CommandDataOptionValue::String(v) = &o.value { Some(v.clone()) } else { None }
+        if let CommandDataOptionValue::String(v) = &o.value {
+            Some(v.clone())
+        } else {
+            None
+        }
     })
 }
 
@@ -978,21 +1041,45 @@ fn get_sub_str(opts: &[CommandDataOption], name: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 fn get_option_i64(cmd: &CommandInteraction, name: &str) -> Option<i64> {
-    cmd.data.options.iter().find(|o| o.name == name).and_then(|o| {
-        if let CommandDataOptionValue::Integer(v) = &o.value { Some(*v) } else { None }
-    })
+    cmd.data
+        .options
+        .iter()
+        .find(|o| o.name == name)
+        .and_then(|o| {
+            if let CommandDataOptionValue::Integer(v) = &o.value {
+                Some(*v)
+            } else {
+                None
+            }
+        })
 }
 
 fn get_option_f64(cmd: &CommandInteraction, name: &str) -> Option<f64> {
-    cmd.data.options.iter().find(|o| o.name == name).and_then(|o| {
-        if let CommandDataOptionValue::Number(v) = &o.value { Some(*v) } else { None }
-    })
+    cmd.data
+        .options
+        .iter()
+        .find(|o| o.name == name)
+        .and_then(|o| {
+            if let CommandDataOptionValue::Number(v) = &o.value {
+                Some(*v)
+            } else {
+                None
+            }
+        })
 }
 
 fn get_option_str(cmd: &CommandInteraction, name: &str) -> Option<String> {
-    cmd.data.options.iter().find(|o| o.name == name).and_then(|o| {
-        if let CommandDataOptionValue::String(v) = &o.value { Some(v.clone()) } else { None }
-    })
+    cmd.data
+        .options
+        .iter()
+        .find(|o| o.name == name)
+        .and_then(|o| {
+            if let CommandDataOptionValue::String(v) = &o.value {
+                Some(v.clone())
+            } else {
+                None
+            }
+        })
 }
 
 // ---------------------------------------------------------------------------

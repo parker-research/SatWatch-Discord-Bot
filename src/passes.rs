@@ -15,7 +15,9 @@
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, TimeZone, Utc};
+use once_cell::unsync::OnceCell;
 use satkit::{Instant as SatInstant, TLE, frametransform, itrfcoord::ITRFCoord, sgp4::sgp4};
+use tracing::debug;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -26,11 +28,13 @@ use satkit::{Instant as SatInstant, TLE, frametransform, itrfcoord::ITRFCoord, s
 pub struct GroundStation {
     pub name: String,
     /// Geodetic latitude, decimal degrees (positive North)
-    pub lat_deg: f64,
+    pub latitude_deg: f64,
     /// Geodetic longitude, decimal degrees (positive East)
-    pub lon_deg: f64,
-    /// Height above ellipsoid in metres
-    pub alt_m: f64,
+    pub longitude_deg: f64,
+    /// Elevation above the ellipsoid (above sea level) in meters.
+    pub elevation_m: f64,
+    /// Height above the ground in meters.
+    pub altitude_m: f64,
 }
 
 /// One predicted pass over a ground station.
@@ -53,11 +57,30 @@ pub struct Pass {
     pub duration_secs: u64,
 }
 
+impl GroundStation {
+    pub fn new(
+        name: String,
+        latitude_deg: f64,
+        longitude_deg: f64,
+        elevation_m: f64,
+        altitude_m: f64,
+    ) -> GroundStation {
+        GroundStation {
+            name,
+            latitude_deg,
+            longitude_deg,
+            elevation_m,
+            altitude_m,
+            // ecef_cache: OnceCell::new(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Find all passes for multiple ground stations.
+/// Find all passes for multiple ground stations, searching from now.
 ///
 /// * `line1`, `line2`  – two TLE lines (no name line)
 /// * `stations`        – slice of ground stations to check
@@ -70,20 +93,36 @@ pub fn find_passes(
     hours: u64,
     min_elev_deg: f64,
 ) -> Result<Vec<Pass>> {
-    let mut tle = TLE::load_2line(line1, line2).map_err(|e| anyhow!("Failed to parse TLE: {e}"))?;
-
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs_f64();
+    find_passes_from(line1, line2, stations, hours, min_elev_deg, now_unix)
+}
 
-    let t_start = SatInstant::from_unixtime(now_unix);
-    let t_end = SatInstant::from_unixtime(now_unix + hours as f64 * 3600.0);
+/// Like [`find_passes`] but with an explicit Unix-seconds start time.
+/// Used by tests and any caller that needs a deterministic window.
+pub fn find_passes_from(
+    line1: &str,
+    line2: &str,
+    stations: &[GroundStation],
+    hours: u64,
+    min_elev_deg: f64,
+    start_unix: f64,
+) -> Result<Vec<Pass>> {
+    let mut tle = TLE::load_2line(line1, line2).map_err(|e| anyhow!("Failed to parse TLE: {e}"))?;
+
+    let t_start = SatInstant::from_unixtime(start_unix);
+    let t_end = SatInstant::from_unixtime(start_unix + hours as f64 * 3600.0);
 
     let mut all_passes: Vec<Pass> = Vec::new();
 
     for station in stations {
-        let gs_itrf = ITRFCoord::from_geodetic_deg(station.lat_deg, station.lon_deg, station.alt_m);
+        let gs_itrf = ITRFCoord::from_geodetic_deg(
+            station.latitude_deg,
+            station.longitude_deg,
+            station.altitude_m + station.elevation_m,
+        );
 
         let mut passes = predict_passes_for_station(
             &mut tle,
@@ -97,9 +136,7 @@ pub fn find_passes(
         all_passes.append(&mut passes);
     }
 
-    // Sort all passes by AOS time
     all_passes.sort_by(|a, b| a.aos_utc.cmp(&b.aos_utc));
-
     Ok(all_passes)
 }
 
@@ -191,6 +228,7 @@ fn predict_passes_for_station(
             }
         };
         let (elev, _az) = look_angles(&pos, &inst, gs_itrf);
+        debug!("t: {t}, elev: {elev}, az: {_az}");
 
         if let Some(prev) = prev_elev {
             // Detect rising edge (below → above min_elev)
@@ -349,4 +387,113 @@ fn scan_pass(
     Ok((
         los_unix, max_t, max_elev, max_az, los_elev, los_az, aos_elev, aos_az,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // NORAD 69015 TLE valid around 2026-05-12 05:08 UTC.
+    const TLE1: &str = "1 69015U 26100AM  26132.21434330  .00004984  00000-0  22703-3 0  9996";
+    const TLE2: &str = "2 69015  97.4040  30.6820 0008982 156.4865 203.6783 15.21097552  1353";
+
+    // RAO ground station, Calgary AB
+    fn rao() -> GroundStation {
+        GroundStation::new("RAO".to_string(), 50.8680, -114.2911, 1200.0, 0.0)
+    }
+
+    // 2026-05-12 00:00:00 UTC — just before the TLE epoch, so SGP4 extrapolation
+    // is minimal and results are most accurate.
+    //
+    // Derivation: 2000-01-01 = 946684800; +26 years (7 leap) = +9497 days =
+    // 946684800 + 820540800 = 1767225600 (2026-01-01); +131 days to May 12 =
+    // 1767225600 + 11318400 = 1778544000.
+    const START_UNIX: f64 = 1778544000.0;
+
+    /// The corrected look_angles must find ≥2 passes per day over RAO.
+    /// A 97.4° LEO at 15.2 rev/day reaches latitudes up to 82.6°, so Calgary
+    /// (50.87°N) is well within view — expect ~3–5 visible passes per day.
+    #[test]
+    fn detects_passes_over_rao_72h() {
+        let passes = find_passes_from(TLE1, TLE2, &[rao()], 72, 5.0, START_UNIX)
+            .expect("pass prediction must not error");
+
+        assert_eq!(passes.len(), 18);
+    }
+
+    /// Each detected pass must meet basic physical constraints.
+    #[test]
+    fn pass_fields_are_physically_valid() {
+        let passes = find_passes_from(TLE1, TLE2, &[rao()], 24, 5.0, START_UNIX)
+            .expect("pass prediction must not error");
+
+        assert!(!passes.is_empty(), "expected at least one pass in 24h");
+
+        for p in &passes {
+            assert!(
+                p.max_elev_deg >= 5.0,
+                "max_elev_deg {:.2}° is below the 5° filter",
+                p.max_elev_deg
+            );
+            assert!(p.duration_secs > 0, "pass duration must be > 0");
+            assert!(p.los_utc > p.aos_utc, "LOS must be after AOS");
+            assert!(
+                p.max_utc >= p.aos_utc && p.max_utc <= p.los_utc,
+                "MAX {} must lie between AOS {} and LOS {}",
+                p.max_utc,
+                p.aos_utc,
+                p.los_utc
+            );
+            // Sanity-check elevation at AOS/LOS — should be near (not far below) threshold.
+            assert!(
+                p.aos_elev_deg >= 4.0,
+                "AOS elevation {:.2}° suspiciously far below threshold",
+                p.aos_elev_deg
+            );
+        }
+    }
+
+    /// Passes must be returned in ascending AOS order.
+    #[test]
+    fn passes_are_chronological() {
+        let passes = find_passes_from(TLE1, TLE2, &[rao()], 72, 5.0, START_UNIX)
+            .expect("pass prediction must not error");
+
+        for w in passes.windows(2) {
+            assert!(
+                w[0].aos_utc <= w[1].aos_utc,
+                "passes out of order: {} > {}",
+                w[0].aos_utc,
+                w[1].aos_utc
+            );
+        }
+    }
+
+    /// All passes must start within the requested search window.
+    #[test]
+    fn passes_within_search_window() {
+        let hours = 24_u64;
+        let end_unix = START_UNIX + hours as f64 * 3600.0;
+
+        let passes = find_passes_from(TLE1, TLE2, &[rao()], hours, 5.0, START_UNIX)
+            .expect("pass prediction must not error");
+
+        for p in &passes {
+            let aos_unix = p.aos_utc.timestamp() as f64;
+            assert!(
+                aos_unix >= START_UNIX,
+                "AOS {} is before the search window start",
+                p.aos_utc
+            );
+            assert!(
+                aos_unix <= end_unix,
+                "AOS {} is after the search window end",
+                p.aos_utc
+            );
+        }
+    }
 }

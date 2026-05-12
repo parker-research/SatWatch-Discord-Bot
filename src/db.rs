@@ -41,7 +41,8 @@ impl Database {
                 name    TEXT    NOT NULL UNIQUE,
                 lat_deg REAL    NOT NULL,
                 lon_deg REAL    NOT NULL,
-                alt_m   REAL    NOT NULL DEFAULT 0.0
+                elevation_m   REAL    NOT NULL,
+                altitude_m    REAL    NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS tracked_satellites (
@@ -76,11 +77,18 @@ impl Database {
     // Ground stations
     // -----------------------------------------------------------------------
 
-    pub fn add_station(&self, name: &str, lat_deg: f64, lon_deg: f64, alt_m: f64) -> Result<()> {
+    pub fn add_station(
+        &self,
+        name: &str,
+        lat_deg: f64,
+        lon_deg: f64,
+        elevation_m: f64,
+        altitude_m: f64,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         match conn.execute(
-            "INSERT INTO ground_stations (name, lat_deg, lon_deg, alt_m) VALUES (?1, ?2, ?3, ?4)",
-            params![name, lat_deg, lon_deg, alt_m],
+            "INSERT INTO ground_stations (name, lat_deg, lon_deg, elevation_m, altitude_m) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, lat_deg, lon_deg, elevation_m, altitude_m],
         ) {
             Ok(_) => Ok(()),
             Err(rusqlite::Error::SqliteFailure(e, _))
@@ -102,15 +110,16 @@ impl Database {
     pub fn list_stations(&self) -> Result<Vec<GroundStation>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT name, lat_deg, lon_deg, alt_m FROM ground_stations ORDER BY name")?;
+            .prepare("SELECT name, lat_deg, lon_deg, elevation_m, altitude_m FROM ground_stations ORDER BY name")?;
         let rows = stmt
             .query_map([], |row| {
-                Ok(GroundStation {
-                    name: row.get(0)?,
-                    lat_deg: row.get(1)?,
-                    lon_deg: row.get(2)?,
-                    alt_m: row.get(3)?,
-                })
+                Ok(GroundStation::new(
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
