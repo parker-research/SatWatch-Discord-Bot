@@ -13,6 +13,7 @@ use serenity::async_trait;
 use serenity::http::Http;
 use serenity::model::gateway::Ready;
 use serenity::prelude::*;
+use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
@@ -999,10 +1000,11 @@ pub async fn run_new_tle_check(http: &Http, db: &Arc<Database>) -> Result<usize>
         return Ok(0);
     }
 
-    let mut announced = 0_usize;
+    let mut announced_count = 0_usize;
+    let mut announced_subscriptions: HashSet<i64> = HashSet::new();
 
     for sub in &subscriptions {
-        let sub_id = sub.id;
+        let sub_id: i64 = sub.id;
         let channel_id = ChannelId::new(sub.channel_id);
 
         // Load this subscription's stations and satellites.
@@ -1119,7 +1121,10 @@ pub async fn run_new_tle_check(http: &Http, db: &Arc<Database>) -> Result<usize>
                     .send_message(http, CreateMessage::new().content(msg))
                     .await
                 {
-                    Ok(_) => announced += indices.len(),
+                    Ok(_) => {
+                        announced_count += indices.len();
+                        announced_subscriptions.insert(sub_id);
+                    }
                     Err(e) => {
                         error!("Failed to send pass notification to channel {channel_id}: {e:#}");
                     }
@@ -1133,7 +1138,12 @@ pub async fn run_new_tle_check(http: &Http, db: &Arc<Database>) -> Result<usize>
         }
     }
 
-    Ok(announced)
+    info!(
+        "New TLE check: announced {announced_count} new overpasses to {} subscription(s)",
+        announced_subscriptions.len()
+    );
+
+    Ok(announced_count)
 }
 
 // ---------------------------------------------------------------------------

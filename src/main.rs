@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
         loop {
             match run_new_tle_check(&http, &db_bg).await {
                 Ok(0) => {}
-                Ok(n) => info!("New TLE check: announced {n} new overpass(es)"),
+                Ok(n) => info!("New TLE check: announced {n} new overpasses"),
                 Err(e) => error!("New TLE check error: {e:#}"),
             }
             tokio::time::sleep(NEW_TLE_POLLING_INTERVAL).await;
