@@ -17,61 +17,15 @@ Otherwise, run the bot on your own machine following the setup instructions in [
 
 ## Slash commands
 
-### `/passes`
-Predict upcoming satellite passes over a ground station.
+* `/satellite add/remove/list` - Manage the watchlist of satellites.
+* `/station add/remove/list` - Manage the watchlist of ground stations.
+* `/set-notify-channel` - Subscribe a channel to receive notifications for satellite passes.
+* `/upcoming-passes` - Query upcoming passes for all subscribed satellites and ground stations.
 
-| Option | Required | Description |
-|---|---|---|
-| `norad_id` | ✅ | NORAD catalog number (e.g. `69015` for FrontierSat) |
-| `lat` | ✅ | Ground station latitude in decimal degrees |
-| `lon` | ✅ | Ground station longitude in decimal degrees |
-| `elevation_m` | ❌ | Altitude above ellipsoid in metres (default 0) |
-| `hours` | ❌ | Search window in hours, 1–72 (default 24) |
-| `min_elev` | ❌ | Minimum peak elevation to report in degrees (default 5) |
-| `station_name` | ❌ | Label for the station (default: coords) |
+### Direct-usage commands
 
-**Example:**
-```
-/passes norad_id:69015 lat:51.0447 lon:-114.0719 elevation_m:1045 station_name:Calgary hours:24 min_elev:10
-```
-
-### `/tle`
-Fetch and display the current TLE from SatNOGS.
-
-| Option | Required | Description |
-|---|---|---|
-| `norad_id` | ✅ | NORAD catalog number |
-
----
-
----
-
-## Architecture
-
-```
-src/
-├── main.rs      – Discord bot entrypoint, slash command registration & routing
-├── satnogs.rs   – Async HTTP fetch of TLE data from SatNOGS DB API
-└── passes.rs    – SGP4 propagation + pass prediction algorithm
-```
-
-### Pass prediction algorithm (`passes.rs`)
-
-1. **Coarse scan** – step through time in 30-second increments, computing
-   elevation at each step via:
-   - `satkit::sgp4::sgp4()` → TEME position (km → m)
-   - `satkit::frametransform::qteme2itrf()` → rotate to ITRF
-   - `ITRFCoord::to_enu()` → East-North-Up vector at the ground station
-   - `el = atan2(Up, √(E²+N²))`, `az = atan2(E, N)`
-
-2. **Rising edge detected** → binary-search bisect (16 iterations, ~1 ms resolution)
-   to find precise AOS time.
-
-3. **Fine scan** inside the pass (10-second steps) to find maximum elevation.
-
-4. **Falling edge detected** → bisect for precise LOS time.
-
-5. Passes filtered to those where peak elevation ≥ `min_elev`.
+* `/tle` - Query TLE data for a satellite by NORAD ID.
+* `/passes` - Query passes for a specific satellite over a ground station.
 
 ## Future Features
 
