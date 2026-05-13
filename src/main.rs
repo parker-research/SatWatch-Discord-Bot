@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
                 break h.clone();
             }
         };
-        info!("Background pass checker started");
+        info!("Background fresh TLE checker started");
 
         loop {
             match run_new_tle_check(&http, &db_bg).await {

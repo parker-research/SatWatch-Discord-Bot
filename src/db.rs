@@ -123,11 +123,9 @@ impl Database {
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
 
         let version: i64 = conn
-            .query_row(
-                "SELECT version FROM schema_version LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
+                row.get(0)
+            })
             .unwrap_or(0);
 
         if version < 2 {
@@ -173,11 +171,11 @@ impl Database {
             .optional()?)
     }
 
-    /// List every subscription (used by the background pass checker).
+    /// List every subscription (used by the background fresh TLE checker).
     pub fn list_subscriptions(&self) -> Result<Vec<Subscription>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, guild_id, channel_id FROM subscriptions ORDER BY id")?;
+        let mut stmt =
+            conn.prepare("SELECT id, guild_id, channel_id FROM subscriptions ORDER BY id")?;
         let rows = stmt
             .query_map([], |row| {
                 let guild_id: i64 = row.get(1)?;
@@ -347,7 +345,13 @@ impl Database {
                  tle_line1   = excluded.tle_line1,
                  tle_line2   = excluded.tle_line2,
                  cached_at   = strftime('%s', 'now')",
-            params![subscription_id, norad_id as i64, tle_updated, tle_line1, tle_line2],
+            params![
+                subscription_id,
+                norad_id as i64,
+                tle_updated,
+                tle_line1,
+                tle_line2
+            ],
         )?;
         Ok(())
     }

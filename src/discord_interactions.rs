@@ -18,10 +18,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
-/// Minimum elevation used by the background pass checker.
+/// Minimum elevation used by the background fresh TLE checker.
 const CHECK_MIN_ELEV_DEG: f64 = 5.0;
 
-/// Search window for the background pass checker.
+/// Search window for the background fresh TLE checker.
 const CHECK_HOURS: u64 = 48;
 
 const SHORT_DELAY_DEBOUCE_DURATION: Duration = Duration::from_millis(500);
@@ -973,7 +973,7 @@ fn format_tle_footer(tle: &satnogs::TleInfo) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Background pass checker
+// Background fresh TLE checker
 // ---------------------------------------------------------------------------
 
 /// Core logic shared by the background loop.
