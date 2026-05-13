@@ -1,4 +1,4 @@
-// sat-discord-bot: Discord bot for satellite pass predictions
+// satwatch-discord-bot: Discord bot for satellite pass predictions
 // Uses satkit for SGP4 propagation + SatNOGS for live TLE data.
 
 mod db;
@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    info!("Starting sat-discord-bot…");
+    info!("Starting satwatch-discord-bot…");
     client.start().await?;
 
     Ok(())

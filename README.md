@@ -1,6 +1,6 @@
 # SatWatch-Discord-Bot
 
-A Discord bot to send CubeSat updates to Discord (beacon data, overpass forecasts).
+A Discord bot to send CubeSat updates to Discord (overpass forecasts, more coming soon).
 
 - **TLE source**: [SatNOGS DB](https://db.satnogs.org/) public API (always fresh)
 - **Propagator**: [satkit](https://docs.rs/satkit) SGP4 (`satkit::sgp4`)
@@ -73,14 +73,6 @@ src/
 
 5. Passes filtered to those where peak elevation ≥ `min_elev`.
 
----
+## Future Features
 
-## Notable NORAD IDs
-
-| Satellite | NORAD | SatNOGS |
-|---|---|---|
-| FrontierSat | 69015 | [GGCH-4346](https://db.satnogs.org/satellite/GGCH-4346-1583-9419-5634) |
-| ISS | 25544 | [ZARYA](https://db.satnogs.org/satellite/AAAA-0000-0000-0000-0001) |
-| NOAA-18 | 28654 | — |
-| NOAA-19 | 33591 | — |
-| Meteor-M N2-3 | 57166 | — |
+* Decode and share beacon data, as collected via SatNOGS.

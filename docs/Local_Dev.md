@@ -23,7 +23,7 @@ Leave it unset for global registration (up to 1 hour delay).
 
 ```bash
 cargo build --release
-./target/release/sat-discord-bot
+./target/release/satwatch-discord-bot
 ```
 
 Or for development:
