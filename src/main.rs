@@ -266,7 +266,7 @@ fn build_commands() -> Vec<CreateCommand> {
             ),
         // /station – manage saved ground stations
         CreateCommand::new("station")
-            .description("Manage saved ground stations")
+            .description("Manage saved ground stations for this channel's subscription")
             .add_option(
                 CreateCommandOption::new(
                     CommandOptionType::SubCommand,
@@ -332,7 +332,7 @@ fn build_commands() -> Vec<CreateCommand> {
             )),
         // /satellite – manage tracked satellites
         CreateCommand::new("satellite")
-            .description("Manage tracked satellites")
+            .description("Manage tracked satellites for this channel's subscription")
             .add_option(
                 CreateCommandOption::new(
                     CommandOptionType::SubCommand,
@@ -396,6 +396,30 @@ async fn send_reply(ctx: &Context, command: &CommandInteraction, content: &str) 
     if let Err(e) = command.create_response(&ctx.http, response).await {
         error!("Failed to send reply: {e}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers – subscription resolution
+// ---------------------------------------------------------------------------
+
+/// Return `guild_id` from the interaction, or an error if used outside a server.
+fn require_guild(command: &CommandInteraction) -> Result<u64> {
+    command
+        .guild_id
+        .map(|g| g.get())
+        .ok_or_else(|| anyhow!("This command can only be used inside a server, not a DM."))
+}
+
+/// Get or create the subscription for the current (guild, channel).
+async fn ensure_subscription(db: &Arc<Database>, guild_id: u64, channel_id: u64) -> Result<i64> {
+    let db2 = db.clone();
+    tokio::task::spawn_blocking(move || db2.ensure_subscription(guild_id, channel_id)).await?
+}
+
+/// Return the subscription id for the current channel, or `None`.
+async fn get_subscription_id(db: &Arc<Database>, channel_id: u64) -> Result<Option<i64>> {
+    let db2 = db.clone();
+    tokio::task::spawn_blocking(move || db2.get_subscription_id(channel_id)).await?
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +545,8 @@ async fn handle_passes(ctx: &Context, command: &CommandInteraction) -> Result<()
 // ---------------------------------------------------------------------------
 
 async fn handle_station(ctx: &Context, command: &CommandInteraction) -> Result<()> {
+    let guild_id = require_guild(command)?;
+    let channel_id = command.channel_id.get();
     let db = get_db(ctx).await;
     let (sub, opts) = get_subcommand(command)?;
 
@@ -537,9 +563,10 @@ async fn handle_station(ctx: &Context, command: &CommandInteraction) -> Result<(
             let altitude_m = get_sub_f64(&opts, "altitude_m")
                 .ok_or_else(|| anyhow!("Missing required option: altitude_m"))?;
 
+            let sub_id = ensure_subscription(&db, guild_id, channel_id).await?;
             let name2 = name.clone();
             match tokio::task::spawn_blocking(move || {
-                db.add_station(&name2, lat, lon, elevation_m, altitude_m)
+                db.add_station(sub_id, &name2, lat, lon, elevation_m, altitude_m)
             })
             .await?
             {
@@ -563,8 +590,17 @@ async fn handle_station(ctx: &Context, command: &CommandInteraction) -> Result<(
             let name = get_sub_str(&opts, "name")
                 .ok_or_else(|| anyhow!("Missing required option: name"))?;
 
+            let sub_id = match get_subscription_id(&db, channel_id).await? {
+                Some(id) => id,
+                None => {
+                    send_reply(ctx, command, "❌ No stations configured in this channel.").await;
+                    return Ok(());
+                }
+            };
+
             let name2 = name.clone();
-            let removed = tokio::task::spawn_blocking(move || db.remove_station(&name2)).await??;
+            let removed =
+                tokio::task::spawn_blocking(move || db.remove_station(sub_id, &name2)).await??;
 
             if removed {
                 send_reply(ctx, command, &format!("✅ Removed station **{name}**.")).await;
@@ -572,14 +608,28 @@ async fn handle_station(ctx: &Context, command: &CommandInteraction) -> Result<(
                 send_reply(
                     ctx,
                     command,
-                    &format!("❌ No station named **{name}** found."),
+                    &format!("❌ No station named **{name}** found in this channel."),
                 )
                 .await;
             }
         }
 
         "list" => {
-            let stations = tokio::task::spawn_blocking(move || db.list_stations()).await??;
+            let sub_id = match get_subscription_id(&db, channel_id).await? {
+                Some(id) => id,
+                None => {
+                    send_reply(
+                        ctx,
+                        command,
+                        "No ground stations saved in this channel. Use `/station add` to add one.",
+                    )
+                    .await;
+                    return Ok(());
+                }
+            };
+
+            let stations =
+                tokio::task::spawn_blocking(move || db.list_stations(sub_id)).await??;
 
             if stations.is_empty() {
                 send_reply(
@@ -610,6 +660,8 @@ async fn handle_station(ctx: &Context, command: &CommandInteraction) -> Result<(
 // ---------------------------------------------------------------------------
 
 async fn handle_satellite(ctx: &Context, command: &CommandInteraction) -> Result<()> {
+    let guild_id = require_guild(command)?;
+    let channel_id = command.channel_id.get();
     let db = get_db(ctx).await;
     let (sub, opts) = get_subcommand(command)?;
 
@@ -621,8 +673,9 @@ async fn handle_satellite(ctx: &Context, command: &CommandInteraction) -> Result
             let label = get_sub_str(&opts, "label");
             let label_ref = label.as_deref().map(String::from);
 
+            let sub_id = ensure_subscription(&db, guild_id, channel_id).await?;
             match tokio::task::spawn_blocking(move || {
-                db.add_satellite(norad_id, label_ref.as_deref())
+                db.add_satellite(sub_id, norad_id, label_ref.as_deref())
             })
             .await?
             {
@@ -646,8 +699,17 @@ async fn handle_satellite(ctx: &Context, command: &CommandInteraction) -> Result
                 .ok_or_else(|| anyhow!("Missing required option: norad_id"))?
                 as u64;
 
+            let sub_id = match get_subscription_id(&db, channel_id).await? {
+                Some(id) => id,
+                None => {
+                    send_reply(ctx, command, "❌ No satellites tracked in this channel.").await;
+                    return Ok(());
+                }
+            };
+
             let removed =
-                tokio::task::spawn_blocking(move || db.remove_satellite(norad_id)).await??;
+                tokio::task::spawn_blocking(move || db.remove_satellite(sub_id, norad_id))
+                    .await??;
 
             if removed {
                 send_reply(
@@ -660,14 +722,27 @@ async fn handle_satellite(ctx: &Context, command: &CommandInteraction) -> Result
                 send_reply(
                     ctx,
                     command,
-                    &format!("❌ NORAD **{norad_id}** is not in the tracking list."),
+                    &format!("❌ NORAD **{norad_id}** is not in the tracking list for this channel."),
                 )
                 .await;
             }
         }
 
         "list" => {
-            let sats = tokio::task::spawn_blocking(move || db.list_satellites()).await??;
+            let sub_id = match get_subscription_id(&db, channel_id).await? {
+                Some(id) => id,
+                None => {
+                    send_reply(
+                        ctx,
+                        command,
+                        "No satellites tracked in this channel. Use `/satellite add` to add one.",
+                    )
+                    .await;
+                    return Ok(());
+                }
+            };
+
+            let sats = tokio::task::spawn_blocking(move || db.list_satellites(sub_id)).await??;
 
             if sats.is_empty() {
                 send_reply(
@@ -696,16 +771,19 @@ async fn handle_satellite(ctx: &Context, command: &CommandInteraction) -> Result
 // ---------------------------------------------------------------------------
 
 async fn handle_set_notify_channel(ctx: &Context, command: &CommandInteraction) -> Result<()> {
+    let guild_id = require_guild(command)?;
     let channel_id = command.channel_id;
-    let value = channel_id.get().to_string();
 
     let db = get_db(ctx).await;
-    tokio::task::spawn_blocking(move || db.set_setting("notify_channel_id", &value)).await??;
+    ensure_subscription(&db, guild_id, channel_id.get()).await?;
 
     send_reply(
         ctx,
         command,
-        &format!("✅ Pass notifications will be sent to <#{channel_id}>."),
+        &format!(
+            "✅ <#{channel_id}> is set up for pass notifications. \
+             Use `/station add` and `/satellite add` to configure what this channel watches."
+        ),
     )
     .await;
     Ok(())
@@ -723,12 +801,29 @@ async fn handle_upcoming_passes(ctx: &Context, command: &CommandInteraction) -> 
         )
         .await?;
 
+    let channel_id = command.channel_id.get();
     let db = get_db(ctx).await;
+
+    let sub_id = match get_subscription_id(&db, channel_id).await? {
+        Some(id) => id,
+        None => {
+            command
+                .edit_response(
+                    &ctx.http,
+                    EditInteractionResponse::new().content(
+                        "This channel has no subscription. \
+                         Use `/set-notify-channel` to set one up.",
+                    ),
+                )
+                .await?;
+            return Ok(());
+        }
+    };
 
     let (stations, satellites) = {
         let db2 = db.clone();
         tokio::task::spawn_blocking(move || -> Result<_> {
-            Ok((db2.list_stations()?, db2.list_satellites()?))
+            Ok((db2.list_stations(sub_id)?, db2.list_satellites(sub_id)?))
         })
         .await??
     };
@@ -865,33 +960,20 @@ async fn handle_upcoming_passes(ctx: &Context, command: &CommandInteraction) -> 
 
 /// Core logic shared by the background loop.
 ///
-/// Fetches fresh TLEs for every tracked satellite, computes passes over every
-/// saved station for the next [`CHECK_HOURS`] hours, and sends a Discord
-/// message for each pass that hasn't been announced before.
+/// Iterates every channel subscription, fetches fresh TLEs for its tracked
+/// satellites, computes passes over its saved stations for the next
+/// [`CHECK_HOURS`] hours, and sends a message to the subscription's channel
+/// for each pass that hasn't been announced before.
 ///
-/// Returns the number of new pass announcements sent.
+/// Returns the total number of new pass announcements sent across all subscriptions.
 async fn run_pass_check(http: &Http, db: &Arc<Database>) -> Result<usize> {
-    // Resolve the notification channel.
-    let channel_id = {
+    // Load all subscriptions.
+    let subscriptions = {
         let db2 = db.clone();
-        let raw =
-            tokio::task::spawn_blocking(move || db2.get_setting("notify_channel_id")).await??;
-        match raw {
-            Some(s) => ChannelId::new(s.parse::<u64>()?),
-            None => return Ok(0),
-        }
+        tokio::task::spawn_blocking(move || db2.list_subscriptions()).await??
     };
 
-    // Load stations and satellites.
-    let (stations, satellites) = {
-        let db2 = db.clone();
-        tokio::task::spawn_blocking(move || -> Result<_> {
-            Ok((db2.list_stations()?, db2.list_satellites()?))
-        })
-        .await??
-    };
-
-    if stations.is_empty() || satellites.is_empty() {
+    if subscriptions.is_empty() {
         return Ok(0);
     }
 
@@ -908,102 +990,123 @@ async fn run_pass_check(http: &Http, db: &Arc<Database>) -> Result<usize> {
 
     let mut announced = 0_usize;
 
-    for sat in &satellites {
-        // Fetch fresh TLE from SatNOGS.
-        let tle = match satnogs::fetch_tle(sat.norad_id).await {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("Failed to fetch TLE for NORAD {}: {e:#}", sat.norad_id);
-                continue;
-            }
+    for sub in &subscriptions {
+        let sub_id = sub.id;
+        let channel_id = ChannelId::new(sub.channel_id);
+
+        // Load this subscription's stations and satellites.
+        let (stations, satellites) = {
+            let db2 = db.clone();
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                Ok((db2.list_stations(sub_id)?, db2.list_satellites(sub_id)?))
+            })
+            .await??
         };
 
-        let display_name = sat.label.as_deref().unwrap_or(&tle.name).to_string();
-
-        // Compute passes (CPU-bound).
-        let tle2 = tle.clone();
-        let stations2 = stations.clone();
-        let norad_id = sat.norad_id;
-        let passes = match tokio::task::spawn_blocking(move || {
-            find_passes(
-                &tle2.line1,
-                &tle2.line2,
-                &stations2,
-                CHECK_HOURS,
-                CHECK_MIN_ELEV_DEG,
-            )
-        })
-        .await
-        {
-            Ok(Ok(p)) => p,
-            Ok(Err(e)) => {
-                warn!("Pass computation failed for NORAD {norad_id}: {e:#}");
-                continue;
-            }
-            Err(e) => {
-                warn!("spawn_blocking panicked for NORAD {norad_id}: {e:#}");
-                continue;
-            }
-        };
-
-        // Collect unnotified passes grouped by station.
-        let mut new_by_station: Vec<(String, Vec<usize>)> = Vec::new();
-        for (i, pass) in passes.iter().enumerate() {
-            let aos_unix = pass.aos_utc.timestamp();
-            let station = pass.station_name.clone();
-            let already_notified = {
-                let db2 = db.clone();
-                let station2 = station.clone();
-                tokio::task::spawn_blocking(move || {
-                    db2.is_pass_notified(norad_id, &station2, aos_unix)
-                })
-                .await??
-            };
-            if !already_notified {
-                match new_by_station.iter().position(|(s, _)| s == &station) {
-                    Some(idx) => new_by_station[idx].1.push(i),
-                    None => new_by_station.push((station, vec![i])),
-                }
-            }
+        if stations.is_empty() || satellites.is_empty() {
+            continue;
         }
 
-        // Send one message per sat×station group.
-        for (station, indices) in &new_by_station {
-            let pass_refs: Vec<&Pass> = indices.iter().map(|&i| &passes[i]).collect();
-            let msg = render_pass_group(
-                &display_name,
-                norad_id,
-                station,
-                &pass_refs,
-                CHECK_MIN_ELEV_DEG,
-                2000,
-            );
-            match channel_id
-                .send_message(http, CreateMessage::new().content(msg))
-                .await
+        for sat in &satellites {
+            // Fetch fresh TLE from SatNOGS.
+            let tle = match satnogs::fetch_tle(sat.norad_id).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(
+                        "Failed to fetch TLE for NORAD {} (sub {}): {e:#}",
+                        sat.norad_id, sub_id
+                    );
+                    continue;
+                }
+            };
+
+            let display_name = sat.label.as_deref().unwrap_or(&tle.name).to_string();
+
+            // Compute passes (CPU-bound).
+            let tle2 = tle.clone();
+            let stations2 = stations.clone();
+            let norad_id = sat.norad_id;
+            let passes = match tokio::task::spawn_blocking(move || {
+                find_passes(
+                    &tle2.line1,
+                    &tle2.line2,
+                    &stations2,
+                    CHECK_HOURS,
+                    CHECK_MIN_ELEV_DEG,
+                )
+            })
+            .await
             {
-                Ok(_) => {
-                    for &i in indices {
-                        let db2 = db.clone();
-                        let station2 = station.clone();
-                        let aos_unix = passes[i].aos_utc.timestamp();
-                        tokio::task::spawn_blocking(move || {
-                            db2.mark_pass_notified(norad_id, &station2, aos_unix)
-                        })
-                        .await??;
-                    }
-                    announced += indices.len();
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => {
+                    warn!("Pass computation failed for NORAD {norad_id} (sub {sub_id}): {e:#}");
+                    continue;
                 }
                 Err(e) => {
-                    error!("Failed to send pass notification: {e:#}");
+                    warn!("spawn_blocking panicked for NORAD {norad_id} (sub {sub_id}): {e:#}");
+                    continue;
+                }
+            };
+
+            // Collect unnotified passes grouped by station.
+            let mut new_by_station: Vec<(String, Vec<usize>)> = Vec::new();
+            for (i, pass) in passes.iter().enumerate() {
+                let aos_unix = pass.aos_utc.timestamp();
+                let station = pass.station_name.clone();
+                let already_notified = {
+                    let db2 = db.clone();
+                    let station2 = station.clone();
+                    tokio::task::spawn_blocking(move || {
+                        db2.is_pass_notified(sub_id, norad_id, &station2, aos_unix)
+                    })
+                    .await??
+                };
+                if !already_notified {
+                    match new_by_station.iter().position(|(s, _)| s == &station) {
+                        Some(idx) => new_by_station[idx].1.push(i),
+                        None => new_by_station.push((station, vec![i])),
+                    }
                 }
             }
-            // Be polite to Discord's rate limiter between messages.
+
+            // Send one message per sat×station group.
+            for (station, indices) in &new_by_station {
+                let pass_refs: Vec<&Pass> = indices.iter().map(|&i| &passes[i]).collect();
+                let msg = render_pass_group(
+                    &display_name,
+                    norad_id,
+                    station,
+                    &pass_refs,
+                    CHECK_MIN_ELEV_DEG,
+                    2000,
+                );
+                match channel_id
+                    .send_message(http, CreateMessage::new().content(msg))
+                    .await
+                {
+                    Ok(_) => {
+                        for &i in indices {
+                            let db2 = db.clone();
+                            let station2 = station.clone();
+                            let aos_unix = passes[i].aos_utc.timestamp();
+                            tokio::task::spawn_blocking(move || {
+                                db2.mark_pass_notified(sub_id, norad_id, &station2, aos_unix)
+                            })
+                            .await??;
+                        }
+                        announced += indices.len();
+                    }
+                    Err(e) => {
+                        error!("Failed to send pass notification to channel {channel_id}: {e:#}");
+                    }
+                }
+                // Be polite to Discord's rate limiter between messages.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+
+            // Be polite to SatNOGS between TLE fetches.
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-
-        // Be polite to SatNOGS between TLE fetches.
-        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     Ok(announced)
