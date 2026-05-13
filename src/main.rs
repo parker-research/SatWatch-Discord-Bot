@@ -58,11 +58,9 @@ impl TypeMapKey for HttpKey {
 /// time-only, both in the viewer's own timezone.
 fn format_pass_line(p: &Pass) -> String {
     format!(
-        "AOS <t:{aos}:f> → LOS <t:{los}:t>  \
-         ({dur_m}m{dur_s:02}s, Peak El {elev:.1}° at <t:{max}:t>)",
+        "<t:{aos}:D> **<t:{aos}:t> → <t:{los}:t>** _({dur_m}m{dur_s:02}s, Peak El **{elev:.1}°**)_",
         aos = p.aos_utc.timestamp(),
         los = p.los_utc.timestamp(),
-        max = p.max_utc.timestamp(),
         elev = p.max_elev_deg,
         dur_m = p.duration_secs / 60,
         dur_s = p.duration_secs % 60,
@@ -87,11 +85,11 @@ fn render_pass_group(
     let header = format!("🛰️ **{name}** (NORAD {norad_id}) @ **{station}**\n");
 
     if passes.is_empty() {
-        return format!("{header}No passes above {min_elev:.0}° in the search window.");
+        return format!("{header}No passes above {min_elev:.1}° in the search window.");
     }
 
     let count_line = format!(
-        "**{}** pass{} above {min_elev:.0}° in the next {CHECK_HOURS}h:\n",
+        "**{}** pass{} above {min_elev:.1}° in the next {CHECK_HOURS}h.\n",
         passes.len(),
         if passes.len() != 1 { "es" } else { "" }
     );
@@ -822,7 +820,7 @@ async fn handle_upcoming_passes(ctx: &Context, command: &CommandInteraction) -> 
             .edit_response(
                 &ctx.http,
                 EditInteractionResponse::new().content(format!(
-                    "No passes above {CHECK_MIN_ELEV_DEG:.0}° found in the next \
+                    "No passes above {CHECK_MIN_ELEV_DEG:.1}° found in the next \
                      {CHECK_HOURS}h for any tracked satellite / saved station combination."
                 )),
             )
