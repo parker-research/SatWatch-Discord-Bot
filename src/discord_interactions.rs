@@ -570,7 +570,7 @@ async fn handle_station(ctx: &Context, command: &CommandInteraction) -> Result<(
                         ctx,
                         command,
                         &format!(
-                            "✅ Saved station **{name}** ({lat:.4}°, {lon:.4}°, {elevation_m:.0} m)."
+                            "✅ Saved station **{name}** ({lat:.5}°, {lon:.5}°, {elevation_m:.1} m ASL + {altitude_m:.1} m AGL)."
                         ),
                     )
                     .await;
@@ -636,8 +636,8 @@ async fn handle_station(ctx: &Context, command: &CommandInteraction) -> Result<(
                 let mut msg = format!("**Ground Stations ({}):**\n", stations.len());
                 for s in &stations {
                     msg.push_str(&format!(
-                        "• **{}** — {:.4}°, {:.4}°, {:.0} m\n",
-                        s.name, s.latitude_deg, s.longitude_deg, s.altitude_m
+                        "* **{}** — {:.5}°, {:.5}°, {:.1} m ASL + {:.1} m AGL\n",
+                        s.name, s.latitude_deg, s.longitude_deg, s.elevation_m, s.altitude_m
                     ));
                 }
                 send_reply(ctx, command, &msg).await;
