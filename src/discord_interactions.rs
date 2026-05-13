@@ -24,8 +24,7 @@ const CHECK_MIN_ELEV_DEG: f64 = 5.0;
 /// Search window for the background pass checker.
 const CHECK_HOURS: u64 = 48;
 
-/// How long to keep notified-pass records before pruning them.
-const NOTIFIED_PASS_TTL_DAYS: i64 = 7;
+const SHORT_DELAY_DEBOUCE_DURATION: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
 // Serenity shared-state keys
@@ -116,6 +115,8 @@ fn render_pass_group(
             "*…{remaining} more — narrow the window or raise min elev*"
         ));
     }
+
+    // TODO: Add the TLE footer here.
 
     out
 }
@@ -622,8 +623,7 @@ async fn handle_station(ctx: &Context, command: &CommandInteraction) -> Result<(
                 }
             };
 
-            let stations =
-                tokio::task::spawn_blocking(move || db.list_stations(sub_id)).await??;
+            let stations = tokio::task::spawn_blocking(move || db.list_stations(sub_id)).await??;
 
             if stations.is_empty() {
                 send_reply(
@@ -716,7 +716,9 @@ async fn handle_satellite(ctx: &Context, command: &CommandInteraction) -> Result
                 send_reply(
                     ctx,
                     command,
-                    &format!("❌ NORAD **{norad_id}** is not in the tracking list for this channel."),
+                    &format!(
+                        "❌ NORAD **{norad_id}** is not in the tracking list for this channel."
+                    ),
                 )
                 .await;
             }
@@ -949,18 +951,44 @@ async fn handle_upcoming_passes(ctx: &Context, command: &CommandInteraction) -> 
 }
 
 // ---------------------------------------------------------------------------
+// TLE footer formatting
+// ---------------------------------------------------------------------------
+
+/// Render the TLE footer appended to every new-TLE pass notification.
+/// Includes the SatNOGS update timestamp as a Discord localised datetime
+/// (`<t:UNIX:f>`) and the raw TLE lines in a code block.
+fn format_tle_footer(tle: &satnogs::TleInfo) -> String {
+    let ts_str = chrono::DateTime::parse_from_str(&tle.updated, "%Y-%m-%dT%H:%M:%S%.f%z")
+        .map(|dt| {
+            let unix = dt.timestamp();
+            // <t:UNIX:f> = localised full date+time, <t:UNIX:R> = relative ("3 minutes ago")
+            format!("<t:{unix}:f> (<t:{unix}:R>)")
+        })
+        .unwrap_or_else(|_| tle.updated.clone());
+
+    format!(
+        "\nTLE Updated: {ts_str}\n```\n{}\n{}\n```",
+        tle.line1, tle.line2
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Background pass checker
 // ---------------------------------------------------------------------------
 
 /// Core logic shared by the background loop.
 ///
 /// Iterates every channel subscription, fetches fresh TLEs for its tracked
-/// satellites, computes passes over its saved stations for the next
-/// [`CHECK_HOURS`] hours, and sends a message to the subscription's channel
-/// for each pass that hasn't been announced before.
+/// satellites, and — when the TLE's `updated` timestamp is new — computes
+/// passes for the next [`CHECK_HOURS`] hours and sends one message per
+/// satellite × station pair.  Each message includes the TLE lines and update
+/// date at the bottom.
 ///
-/// Returns the total number of new pass announcements sent across all subscriptions.
-pub async fn run_pass_check(http: &Http, db: &Arc<Database>) -> Result<usize> {
+/// The TLE is written to the cache before messages are sent; a failed Discord
+/// send is logged but not retried (avoids duplicate spam on transient errors).
+///
+/// Returns the total number of passes included in notifications sent.
+pub async fn run_new_tle_check(http: &Http, db: &Arc<Database>) -> Result<usize> {
     // Load all subscriptions.
     let subscriptions = {
         let db2 = db.clone();
@@ -969,17 +997,6 @@ pub async fn run_pass_check(http: &Http, db: &Arc<Database>) -> Result<usize> {
 
     if subscriptions.is_empty() {
         return Ok(0);
-    }
-
-    // Prune stale de-duplication records (passes whose AOS is older than TTL).
-    let cutoff = chrono::Utc::now().timestamp() - NOTIFIED_PASS_TTL_DAYS * 86_400;
-    {
-        let db2 = db.clone();
-        let pruned =
-            tokio::task::spawn_blocking(move || db2.cleanup_old_notified_passes(cutoff)).await??;
-        if pruned > 0 {
-            info!("Pruned {pruned} old notified-pass record(s)");
-        }
     }
 
     let mut announced = 0_usize;
@@ -1002,24 +1019,55 @@ pub async fn run_pass_check(http: &Http, db: &Arc<Database>) -> Result<usize> {
         }
 
         for sat in &satellites {
+            let norad_id = sat.norad_id;
+
             // Fetch fresh TLE from SatNOGS.
-            let tle = match satnogs::fetch_tle(sat.norad_id).await {
+            let tle = match satnogs::fetch_tle(norad_id).await {
                 Ok(t) => t,
                 Err(e) => {
                     warn!(
                         "Failed to fetch TLE for NORAD {} (sub {}): {e:#}",
-                        sat.norad_id, sub_id
+                        norad_id, sub_id
                     );
+                    tokio::time::sleep(SHORT_DELAY_DEBOUCE_DURATION).await;
                     continue;
                 }
             };
+
+            // Skip if this TLE has already been announced for this subscription.
+            let cached_updated = {
+                let db2 = db.clone();
+                tokio::task::spawn_blocking(move || db2.get_cached_tle_updated(sub_id, norad_id))
+                    .await??
+            };
+            if cached_updated.as_deref() == Some(tle.updated.as_str()) {
+                tokio::time::sleep(SHORT_DELAY_DEBOUCE_DURATION).await;
+                continue;
+            }
+
+            info!(
+                "New TLE for NORAD {norad_id} (sub {sub_id}): updated {}",
+                tle.updated
+            );
+
+            // Cache the TLE before sending — a failed Discord delivery won't
+            // cause a retry, but that is preferable to spamming on transient errors.
+            {
+                let db2 = db.clone();
+                let updated = tle.updated.clone();
+                let line1 = tle.line1.clone();
+                let line2 = tle.line2.clone();
+                tokio::task::spawn_blocking(move || {
+                    db2.upsert_tle_cache(sub_id, norad_id, &updated, &line1, &line2)
+                })
+                .await??;
+            }
 
             let display_name = sat.label.as_deref().unwrap_or(&tle.name).to_string();
 
             // Compute passes (CPU-bound).
             let tle2 = tle.clone();
             let stations2 = stations.clone();
-            let norad_id = sat.norad_id;
             let passes = match tokio::task::spawn_blocking(move || {
                 find_passes(
                     &tle2.line1,
@@ -1034,72 +1082,54 @@ pub async fn run_pass_check(http: &Http, db: &Arc<Database>) -> Result<usize> {
                 Ok(Ok(p)) => p,
                 Ok(Err(e)) => {
                     warn!("Pass computation failed for NORAD {norad_id} (sub {sub_id}): {e:#}");
+                    tokio::time::sleep(SHORT_DELAY_DEBOUCE_DURATION).await;
                     continue;
                 }
                 Err(e) => {
                     warn!("spawn_blocking panicked for NORAD {norad_id} (sub {sub_id}): {e:#}");
+                    tokio::time::sleep(SHORT_DELAY_DEBOUCE_DURATION).await;
                     continue;
                 }
             };
 
-            // Collect unnotified passes grouped by station.
-            let mut new_by_station: Vec<(String, Vec<usize>)> = Vec::new();
+            // Group passes by station.
+            let mut by_station: Vec<(String, Vec<usize>)> = Vec::new();
             for (i, pass) in passes.iter().enumerate() {
-                let aos_unix = pass.aos_utc.timestamp();
                 let station = pass.station_name.clone();
-                let already_notified = {
-                    let db2 = db.clone();
-                    let station2 = station.clone();
-                    tokio::task::spawn_blocking(move || {
-                        db2.is_pass_notified(sub_id, norad_id, &station2, aos_unix)
-                    })
-                    .await??
-                };
-                if !already_notified {
-                    match new_by_station.iter().position(|(s, _)| s == &station) {
-                        Some(idx) => new_by_station[idx].1.push(i),
-                        None => new_by_station.push((station, vec![i])),
-                    }
+                match by_station.iter().position(|(s, _)| s == &station) {
+                    Some(idx) => by_station[idx].1.push(i),
+                    None => by_station.push((station, vec![i])),
                 }
             }
 
-            // Send one message per sat×station group.
-            for (station, indices) in &new_by_station {
+            // Send one message per sat×station group, with TLE footer appended.
+            for (station, indices) in &by_station {
                 let pass_refs: Vec<&Pass> = indices.iter().map(|&i| &passes[i]).collect();
-                let msg = render_pass_group(
+                let mut msg = render_pass_group(
                     &display_name,
                     norad_id,
                     station,
                     &pass_refs,
                     CHECK_MIN_ELEV_DEG,
-                    2000,
+                    1800,
                 );
+                msg.push_str(&format_tle_footer(&tle));
+
                 match channel_id
                     .send_message(http, CreateMessage::new().content(msg))
                     .await
                 {
-                    Ok(_) => {
-                        for &i in indices {
-                            let db2 = db.clone();
-                            let station2 = station.clone();
-                            let aos_unix = passes[i].aos_utc.timestamp();
-                            tokio::task::spawn_blocking(move || {
-                                db2.mark_pass_notified(sub_id, norad_id, &station2, aos_unix)
-                            })
-                            .await??;
-                        }
-                        announced += indices.len();
-                    }
+                    Ok(_) => announced += indices.len(),
                     Err(e) => {
                         error!("Failed to send pass notification to channel {channel_id}: {e:#}");
                     }
                 }
                 // Be polite to Discord's rate limiter between messages.
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(SHORT_DELAY_DEBOUCE_DURATION).await;
             }
 
             // Be polite to SatNOGS between TLE fetches.
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(SHORT_DELAY_DEBOUCE_DURATION).await;
         }
     }
 

@@ -1,5 +1,5 @@
 // db.rs – SQLite persistence for ground stations, tracked satellites,
-// and de-duplication of already-notified passes, scoped per Discord channel subscription.
+// subscriptions, and TLE cache for triggering pass notifications.
 //
 // All public methods are synchronous and should be called inside
 // `tokio::task::spawn_blocking` from async code.
@@ -31,16 +31,18 @@ pub struct Subscription {
 // Schema
 // ---------------------------------------------------------------------------
 
-/// Bump this whenever the schema changes incompatibly.
-const SCHEMA_VERSION: i64 = 2;
+/// Bump this whenever the schema changes.
+#[allow(dead_code)]
+const SCHEMA_VERSION: i64 = 3;
 
-/// Drops the old V1 tables (if any) and creates the V2 schema from scratch.
-/// Called once on open when the stored version is below SCHEMA_VERSION.
-const MIGRATION_SQL: &str = "
+/// Full rebuild for any version < 2.  Creates the V2 schema (still includes
+/// notified_passes; the V3 migration immediately replaces it on the same open).
+const MIGRATION_V2_SQL: &str = "
     DROP TABLE IF EXISTS notified_passes;
     DROP TABLE IF EXISTS tracked_satellites;
     DROP TABLE IF EXISTS ground_stations;
     DROP TABLE IF EXISTS settings;
+    DROP TABLE IF EXISTS tle_cache;
     DROP TABLE IF EXISTS schema_version;
 
     CREATE TABLE schema_version (version INTEGER NOT NULL);
@@ -76,7 +78,6 @@ const MIGRATION_SQL: &str = "
         UNIQUE(subscription_id, norad_id)
     );
 
-    -- De-duplication: (subscription, sat, station, AOS) tuples that have already been announced.
     CREATE TABLE notified_passes (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
         subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
@@ -86,6 +87,25 @@ const MIGRATION_SQL: &str = "
         notified_at     INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
         UNIQUE(subscription_id, norad_id, station, aos_unix)
     );
+";
+
+/// Incremental V2 → V3: replace per-pass de-duplication with TLE-based triggering.
+const MIGRATION_V3_SQL: &str = "
+    DROP TABLE IF EXISTS notified_passes;
+
+    -- Stores the last TLE fetched per (subscription, satellite).
+    -- A new TLE (different tle_updated value) triggers a fresh pass announcement.
+    CREATE TABLE IF NOT EXISTS tle_cache (
+        subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+        norad_id        INTEGER NOT NULL,
+        tle_updated     TEXT    NOT NULL,
+        tle_line1       TEXT    NOT NULL,
+        tle_line2       TEXT    NOT NULL,
+        cached_at       INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+        PRIMARY KEY (subscription_id, norad_id)
+    );
+
+    UPDATE schema_version SET version = 3;
 ";
 
 // ---------------------------------------------------------------------------
@@ -102,7 +122,7 @@ impl Database {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
 
-        let current_version: i64 = conn
+        let version: i64 = conn
             .query_row(
                 "SELECT version FROM schema_version LIMIT 1",
                 [],
@@ -110,8 +130,11 @@ impl Database {
             )
             .unwrap_or(0);
 
-        if current_version < SCHEMA_VERSION {
-            conn.execute_batch(MIGRATION_SQL)?;
+        if version < 2 {
+            conn.execute_batch(MIGRATION_V2_SQL)?;
+        }
+        if version < 3 {
+            conn.execute_batch(MIGRATION_V3_SQL)?;
         }
 
         Ok(Self {
@@ -285,49 +308,47 @@ impl Database {
     }
 
     // -----------------------------------------------------------------------
-    // Pass de-duplication
+    // TLE cache
     // -----------------------------------------------------------------------
 
-    pub fn is_pass_notified(
+    /// Return the `tle_updated` string of the last cached TLE for this
+    /// (subscription, satellite) pair, or `None` if never cached.
+    pub fn get_cached_tle_updated(
         &self,
         subscription_id: i64,
         norad_id: u64,
-        station: &str,
-        aos_unix: i64,
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM notified_passes
-             WHERE subscription_id = ?1 AND norad_id = ?2 AND station = ?3 AND aos_unix = ?4",
-            params![subscription_id, norad_id as i64, station, aos_unix],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
+        Ok(conn
+            .query_row(
+                "SELECT tle_updated FROM tle_cache
+                 WHERE subscription_id = ?1 AND norad_id = ?2",
+                params![subscription_id, norad_id as i64],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
-    pub fn mark_pass_notified(
+    /// Insert or update the cached TLE for this (subscription, satellite) pair.
+    pub fn upsert_tle_cache(
         &self,
         subscription_id: i64,
         norad_id: u64,
-        station: &str,
-        aos_unix: i64,
+        tle_updated: &str,
+        tle_line1: &str,
+        tle_line2: &str,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR IGNORE INTO notified_passes (subscription_id, norad_id, station, aos_unix)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![subscription_id, norad_id as i64, station, aos_unix],
+            "INSERT INTO tle_cache (subscription_id, norad_id, tle_updated, tle_line1, tle_line2)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(subscription_id, norad_id) DO UPDATE SET
+                 tle_updated = excluded.tle_updated,
+                 tle_line1   = excluded.tle_line1,
+                 tle_line2   = excluded.tle_line2,
+                 cached_at   = strftime('%s', 'now')",
+            params![subscription_id, norad_id as i64, tle_updated, tle_line1, tle_line2],
         )?;
         Ok(())
-    }
-
-    /// Delete notified-pass records whose AOS is older than `cutoff_unix`.
-    pub fn cleanup_old_notified_passes(&self, cutoff_unix: i64) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
-        let n = conn.execute(
-            "DELETE FROM notified_passes WHERE aos_unix < ?1",
-            params![cutoff_unix],
-        )?;
-        Ok(n)
     }
 }

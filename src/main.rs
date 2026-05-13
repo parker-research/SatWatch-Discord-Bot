@@ -7,7 +7,7 @@ mod passes;
 mod satnogs;
 
 use db::Database;
-use discord_interactions::{DatabaseKey, Handler, HttpKey, run_pass_check};
+use discord_interactions::{DatabaseKey, Handler, HttpKey, run_new_tle_check};
 
 use anyhow::Result;
 use serenity::all::GatewayIntents;
@@ -16,6 +16,8 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info};
+
+const NEW_TLE_POLLING_INTERVAL: Duration = Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -62,12 +64,12 @@ async fn main() -> Result<()> {
         info!("Background pass checker started");
 
         loop {
-            match run_pass_check(&http, &db_bg).await {
+            match run_new_tle_check(&http, &db_bg).await {
                 Ok(0) => {}
-                Ok(n) => info!("Pass check: announced {n} new pass(es)"),
-                Err(e) => error!("Pass check error: {e:#}"),
+                Ok(n) => info!("New TLE check: announced {n} new overpass(es)"),
+                Err(e) => error!("New TLE check error: {e:#}"),
             }
-            tokio::time::sleep(Duration::from_secs(600)).await;
+            tokio::time::sleep(NEW_TLE_POLLING_INTERVAL).await;
         }
     });
 
