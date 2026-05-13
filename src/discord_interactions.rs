@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Minimum elevation used by the background fresh TLE checker.
 const CHECK_MIN_ELEV_DEG: f64 = 5.0;
@@ -62,10 +62,8 @@ fn format_pass_line(p: &Pass) -> String {
 }
 
 /// Render all passes for one satellite × ground-station pair as a single Discord
-/// message block.  The group header (`🛰️ Sat @ Station`) is printed once at the
-/// top; pass lines below carry only timing/elevation.  `context`, if non-empty,
-/// is appended to the pass-count line (e.g. "next 24h | min elev 5°").
-/// Truncates with a "…N more" footer if `char_limit` would be exceeded.
+/// message block.  When `tle` is `Some`, the TLE update timestamp and raw lines
+/// are appended as a footer (used for both /upcoming-passes and new-TLE alerts).
 fn render_pass_group(
     name: &str,
     norad_id: u64,
@@ -73,6 +71,7 @@ fn render_pass_group(
     passes: &[&Pass],
     min_elev: f64,
     char_limit: usize,
+    tle: &satnogs::TleInfo,
 ) -> String {
     const FOOTER_RESERVE: usize = 60;
 
@@ -88,7 +87,6 @@ fn render_pass_group(
         if passes.len() != 1 { "es" } else { "" }
     );
 
-    // Group passes by consecutive AOS/LOS intervals, separated by a blank line.
     let mut rendered: Vec<String> = Vec::new();
     for (i, pass) in passes.iter().enumerate() {
         if i > 0 && pass.aos_utc - passes[i - 1].los_utc > chrono::Duration::hours(3) {
@@ -97,11 +95,14 @@ fn render_pass_group(
         rendered.push(format_pass_line(pass));
     }
 
+    // Reserve extra space for the TLE footer if we'll be appending one.
+    let footer = format_tle_footer(tle);
+
     let mut out = format!("{header}{count_line}\n");
     let mut included = 0;
 
     for line in &rendered {
-        let projected = out.len() + line.len() + 1 + FOOTER_RESERVE;
+        let projected = out.len() + line.len() + 1 + footer.len() + FOOTER_RESERVE;
         if projected > char_limit {
             break;
         }
@@ -117,7 +118,7 @@ fn render_pass_group(
         ));
     }
 
-    // TODO: Add the TLE footer here.
+    out.push_str(&footer);
 
     out
 }
@@ -433,6 +434,12 @@ async fn handle_tle(ctx: &Context, command: &CommandInteraction) -> Result<()> {
         )
         .await?;
 
+    debug!(
+        channel_id = command.channel_id.get(),
+        norad_id = norad_id,
+        "Handle: /tle <details>",
+    );
+
     match satnogs::fetch_tle(norad_id).await {
         Ok(tle_info) => {
             let msg = format!(
@@ -463,6 +470,11 @@ async fn handle_tle(ctx: &Context, command: &CommandInteraction) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn handle_passes(ctx: &Context, command: &CommandInteraction) -> Result<()> {
+    debug!(
+        channel_id = command.channel_id.get(),
+        "Handle: /passes <details>"
+    );
+
     let norad_id = get_option_i64(command, "norad_id").unwrap_or(0) as u64;
     let latitude_deg = get_option_f64(command, "lat").unwrap_or(0.0);
     let longitude_deg = get_option_f64(command, "lon").unwrap_or(0.0);
@@ -527,6 +539,7 @@ async fn handle_passes(ctx: &Context, command: &CommandInteraction) -> Result<()
         &pass_refs,
         min_elev,
         2000,
+        &tle_info.clone(),
     );
 
     command
@@ -543,8 +556,15 @@ async fn handle_passes(ctx: &Context, command: &CommandInteraction) -> Result<()
 async fn handle_station(ctx: &Context, command: &CommandInteraction) -> Result<()> {
     let guild_id = require_guild(command)?;
     let channel_id = command.channel_id.get();
+
     let db = get_db(ctx).await;
     let (sub, opts) = get_subcommand(command)?;
+
+    debug!(
+        channel_id = command.channel_id.get(),
+        "Handle: /station {} <details>",
+        sub.as_str()
+    );
 
     match sub.as_str() {
         "add" => {
@@ -660,6 +680,12 @@ async fn handle_satellite(ctx: &Context, command: &CommandInteraction) -> Result
     let db = get_db(ctx).await;
     let (sub, opts) = get_subcommand(command)?;
 
+    debug!(
+        channel_id = command.channel_id.get(),
+        "Handle: /satellite {} <details>",
+        sub.as_str()
+    );
+
     match sub.as_str() {
         "add" => {
             let norad_id = get_sub_i64(&opts, "norad_id")
@@ -767,9 +793,16 @@ async fn handle_satellite(ctx: &Context, command: &CommandInteraction) -> Result
 // /set-notify-channel handler
 // ---------------------------------------------------------------------------
 
+// TODO: Add a way to unsubscribe a channel.
 async fn handle_set_notify_channel(ctx: &Context, command: &CommandInteraction) -> Result<()> {
     let guild_id = require_guild(command)?;
     let channel_id = command.channel_id;
+
+    debug!(
+        channel_id = command.channel_id.get(),
+        guild_id = guild_id,
+        "Handle: /set-notify-channel",
+    );
 
     let db = get_db(ctx).await;
     ensure_subscription(&db, guild_id, channel_id.get()).await?;
@@ -778,9 +811,13 @@ async fn handle_set_notify_channel(ctx: &Context, command: &CommandInteraction) 
         ctx,
         command,
         &format!(
-            "✅ <#{channel_id}> is set up for pass notifications. \
-             Use `/station add` and `/satellite add` to configure what this channel watches."
-        ),
+            r#"✅ <#{channel_id}> is set up for automatic pass notifications!
+
+Notifications are sent when TLEs are updated.
+
+Use `/station add` and `/satellite add` to configure what this channel watches."#
+        )
+        .trim(),
     )
     .await;
     Ok(())
@@ -799,6 +836,8 @@ async fn handle_upcoming_passes(ctx: &Context, command: &CommandInteraction) -> 
         .await?;
 
     let channel_id = command.channel_id.get();
+    debug!(channel_id = channel_id, "Handle: /upcoming-passes");
+
     let db = get_db(ctx).await;
 
     let sub_id = match get_subscription_id(&db, channel_id).await? {
@@ -848,10 +887,10 @@ async fn handle_upcoming_passes(ctx: &Context, command: &CommandInteraction) -> 
 
     // Fetch TLEs and compute passes for every satellite, then merge and sort.
     // Does NOT touch the notified_passes table.
-    let mut all_passes: Vec<(String, u64, Pass)> = Vec::new();
+    let mut all_passes: Vec<(String, u64, Pass, satnogs::TleInfo)> = Vec::new();
 
     for sat in &satellites {
-        let tle = match satnogs::fetch_tle(sat.norad_id).await {
+        let tle_info = match satnogs::fetch_tle(sat.norad_id).await {
             Ok(t) => t,
             Err(e) => {
                 warn!("Failed to fetch TLE for NORAD {}: {e:#}", sat.norad_id);
@@ -859,9 +898,9 @@ async fn handle_upcoming_passes(ctx: &Context, command: &CommandInteraction) -> 
             }
         };
 
-        let display_name = sat.label.as_deref().unwrap_or(&tle.name).to_string();
+        let display_name = sat.label.as_deref().unwrap_or(&tle_info.name).to_string();
         let norad_id = sat.norad_id;
-        let tle2 = tle.clone();
+        let tle2 = tle_info.clone();
         let stations2 = stations.clone();
 
         let passes = match tokio::task::spawn_blocking(move || {
@@ -887,19 +926,19 @@ async fn handle_upcoming_passes(ctx: &Context, command: &CommandInteraction) -> 
         };
 
         for pass in passes {
-            all_passes.push((display_name.clone(), norad_id, pass));
+            all_passes.push((display_name.clone(), norad_id, pass, tle_info.clone()));
         }
     }
 
     // Sort all passes chronologically by AOS across all satellites and stations.
-    all_passes.sort_by_key(|(_, _, p)| p.aos_utc);
+    all_passes.sort_by_key(|(_, _, pass, _)| pass.aos_utc);
 
     // Group by (sat_name, norad_id, station_name), preserving AOS order within each group.
     let mut groups: Vec<(String, u64, String, Vec<usize>)> = Vec::new();
-    for (i, (name, norad_id, pass)) in all_passes.iter().enumerate() {
+    for (i, (name, norad_id, pass, _)) in all_passes.iter().enumerate() {
         match groups
             .iter()
-            .position(|(n, nid, s, _)| n == name && nid == norad_id && s == &pass.station_name)
+            .position(|(n, nid, s, _tle)| n == name && nid == norad_id && s == &pass.station_name)
         {
             Some(idx) => groups[idx].3.push(i),
             None => groups.push((name.clone(), *norad_id, pass.station_name.clone(), vec![i])),
@@ -924,6 +963,8 @@ async fn handle_upcoming_passes(ctx: &Context, command: &CommandInteraction) -> 
     let mut first = true;
     for (name, norad_id, station, indices) in &groups {
         let pass_refs: Vec<&Pass> = indices.iter().map(|&i| &all_passes[i].2).collect();
+        let tle_info = &all_passes[indices[0]].3; // All same TLE, take first.
+
         let msg = render_pass_group(
             name,
             *norad_id,
@@ -931,6 +972,7 @@ async fn handle_upcoming_passes(ctx: &Context, command: &CommandInteraction) -> 
             &pass_refs,
             CHECK_MIN_ELEV_DEG,
             2000,
+            tle_info,
         );
         if first {
             command
@@ -1107,15 +1149,15 @@ pub async fn run_new_tle_check(http: &Http, db: &Arc<Database>) -> Result<usize>
             // Send one message per sat×station group, with TLE footer appended.
             for (station, indices) in &by_station {
                 let pass_refs: Vec<&Pass> = indices.iter().map(|&i| &passes[i]).collect();
-                let mut msg = render_pass_group(
+                let msg = render_pass_group(
                     &display_name,
                     norad_id,
                     station,
                     &pass_refs,
                     CHECK_MIN_ELEV_DEG,
                     1800,
+                    &tle,
                 );
-                msg.push_str(&format_tle_footer(&tle));
 
                 match channel_id
                     .send_message(http, CreateMessage::new().content(msg))
