@@ -9,6 +9,12 @@ A Discord bot to send CubeSat updates to Discord (beacon data, overpass forecast
 
 ---
 
+## Usage
+
+If you are interested in using this bot, feel free to open a GitHub Issue, and I can help you install the bot in your Discord server.
+
+Otherwise, run the bot on your own machine following the setup instructions in [Local Dev](docs/Local_Dev.md).
+
 ## Slash commands
 
 ### `/passes`
