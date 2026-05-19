@@ -5,7 +5,7 @@
 //
 // Returns the most recent TLE record(s) for that NORAD ID.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
 /// Minimal representation of what SatNOGS returns for a TLE entry.
@@ -33,9 +33,7 @@ pub struct TleInfo {
 ///
 /// SatNOGS sorts results newest-first, so we take index [0].
 pub async fn fetch_tle(norad_id: u64) -> Result<TleInfo> {
-    let url = format!(
-        "https://db.satnogs.org/api/tle/?norad_cat_id={norad_id}&format=json"
-    );
+    let url = format!("https://db.satnogs.org/api/tle/?norad_cat_id={norad_id}&format=json");
 
     let response = reqwest::get(&url).await?;
 

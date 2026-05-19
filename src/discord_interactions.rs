@@ -810,7 +810,7 @@ async fn handle_set_notify_channel(ctx: &Context, command: &CommandInteraction) 
     send_reply(
         ctx,
         command,
-        &format!(
+        format!(
             r#"✅ <#{channel_id}> is set up for automatic pass notifications!
 
 Notifications are sent when TLEs are updated.
