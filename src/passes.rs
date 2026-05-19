@@ -87,7 +87,7 @@ pub fn find_passes(
     line1: &str,
     line2: &str,
     stations: &[GroundStation],
-    hours: u64,
+    hours: f64,
     min_elev_deg: f64,
 ) -> Result<Vec<Pass>> {
     let now_unix = std::time::SystemTime::now()
@@ -103,14 +103,14 @@ pub fn find_passes_from(
     line1: &str,
     line2: &str,
     stations: &[GroundStation],
-    hours: u64,
+    hours: f64,
     min_elev_deg: f64,
     start_unix: f64,
 ) -> Result<Vec<Pass>> {
     let mut tle = TLE::load_2line(line1, line2).map_err(|e| anyhow!("Failed to parse TLE: {e}"))?;
 
     let t_start = SatInstant::from_unixtime(start_unix);
-    let t_end = SatInstant::from_unixtime(start_unix + hours as f64 * 3600.0);
+    let t_end = SatInstant::from_unixtime(start_unix + hours * 3600.0);
 
     let mut all_passes: Vec<Pass> = Vec::new();
 
@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn detects_passes_over_rao_72h() {
-        let passes = find_passes_from(TLE1, TLE2, &[rao()], 72, 5.0, START_UNIX)
+        let passes = find_passes_from(TLE1, TLE2, &[rao()], 72.0, 5.0, START_UNIX)
             .expect("pass prediction must not error");
 
         assert_eq!(passes.len(), 16);
@@ -344,7 +344,7 @@ mod tests {
     /// Each detected pass must meet basic physical constraints.
     #[test]
     fn pass_fields_are_physically_valid() {
-        let passes = find_passes_from(TLE1, TLE2, &[rao()], 24, 5.0, START_UNIX)
+        let passes = find_passes_from(TLE1, TLE2, &[rao()], 24.0, 5.0, START_UNIX)
             .expect("pass prediction must not error");
 
         assert!(!passes.is_empty(), "expected at least one pass in 24h");
@@ -376,7 +376,7 @@ mod tests {
     /// Passes must be returned in ascending AOS order.
     #[test]
     fn passes_are_chronological() {
-        let passes = find_passes_from(TLE1, TLE2, &[rao()], 72, 5.0, START_UNIX)
+        let passes = find_passes_from(TLE1, TLE2, &[rao()], 72.0, 5.0, START_UNIX)
             .expect("pass prediction must not error");
 
         for w in passes.windows(2) {
@@ -392,8 +392,8 @@ mod tests {
     /// All passes must start within the requested search window.
     #[test]
     fn passes_within_search_window() {
-        let hours = 24_u64;
-        let end_unix = START_UNIX + hours as f64 * 3600.0;
+        let hours: f64 = 24.0;
+        let end_unix = START_UNIX + hours * 3600.0;
 
         let passes = find_passes_from(TLE1, TLE2, &[rao()], hours, 5.0, START_UNIX)
             .expect("pass prediction must not error");
@@ -411,5 +411,47 @@ mod tests {
                 p.aos_utc
             );
         }
+    }
+
+    /// All passes must start within the requested search window.
+    #[test]
+    fn passes_overlapping_start_and_end_are_excluded() {
+        // Passes are:
+        // 2026-05-13 05:21:07 UTC to 2026-05-13 05:26:20 UTC -> Should not be in result.
+        // 2026-05-13 06:53:31 UTC to 2026-05-13 07:02:40 UTC
+        // 2026-05-13 08:28:29 UTC to 2026-05-13 08:34:05 UTC
+        // 2026-05-13 16:04:57 UTC to 2026-05-13 16:10:35 UTC
+        // 2026-05-13 17:36:20 UTC to 2026-05-13 17:45:33 UTC
+        // 2026-05-13 19:12:34 UTC to 2026-05-13 19:18:02 UTC -> Should not be in result.
+
+        // Search start is 53 seconds after the first AOS.
+        let search_start_unix = DateTime::parse_from_rfc3339("2026-05-13T05:22:00+00:00")
+            .unwrap()
+            .timestamp() as f64;
+
+        // Search end is in the middle of the last AOS.
+        let search_end_fix: f64 = DateTime::parse_from_rfc3339("2026-05-13T19:15:00+00:00")
+            .unwrap()
+            .timestamp() as f64;
+
+        let search_window_duration_hours: f64 = (search_end_fix - search_start_unix) / 3600.0;
+
+        let passes = find_passes_from(
+            TLE1,
+            TLE2,
+            &[rao()],
+            search_window_duration_hours,
+            5.0,
+            search_start_unix,
+        )
+        .expect("pass prediction must not error");
+
+        assert_eq!(
+            passes.len(),
+            4,
+            "Expected 4 passes, got {}. Ensure the overlapping passes are excluded. Passes: {:?}",
+            passes.len(),
+            passes
+        );
     }
 }

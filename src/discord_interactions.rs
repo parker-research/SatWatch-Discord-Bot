@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 const CHECK_MIN_ELEV_DEG: f64 = 5.0;
 
 /// Search window for the background fresh TLE checker.
-const CHECK_HOURS: u64 = 48;
+const CHECK_HOURS: f64 = 48.0;
 
 const SHORT_DELAY_DEBOUCE_DURATION: Duration = Duration::from_millis(500);
 
@@ -524,7 +524,7 @@ async fn handle_passes(ctx: &Context, command: &CommandInteraction) -> Result<()
             &tle_clone.line1,
             &tle_clone.line2,
             &[gs_clone],
-            hours,
+            hours as f64,
             min_elev,
         )
     })
