@@ -246,6 +246,10 @@ impl PassBuilder {
     }
 }
 
+/// Predicts passes for a given station over a specified time range.
+///
+/// Only returns passes that start after `t_start` and end before `t_end`.
+/// Does not return passes that overlap with `t_start` or `t_end`.
 fn predict_passes_for_station(
     tle: &mut TLE,
     gs_itrf: &ITRFCoord,
@@ -271,6 +275,7 @@ fn predict_passes_for_station(
                 // Propagation failed — close any open pass and skip ahead.
                 if let Some(builder) = current_pass.take()
                     && builder.max_elev >= min_elev_deg
+                    && builder.aos_unix > unix_start
                 {
                     passes.push(builder.finish(station_name));
                 }
@@ -294,6 +299,7 @@ fn predict_passes_for_station(
                 // Falling edge: satellite dropped below threshold.
                 if let Some(builder) = current_pass.take()
                     && builder.max_elev >= min_elev_deg
+                    && builder.aos_unix > unix_start
                 {
                     passes.push(builder.finish(station_name));
                 }
@@ -304,12 +310,7 @@ fn predict_passes_for_station(
         t += STEP_TIME_SEC;
     }
 
-    // Close any pass still open at the end of the window.
-    if let Some(builder) = current_pass.take()
-        && builder.max_elev >= min_elev_deg
-    {
-        passes.push(builder.finish(station_name));
-    }
+    // Any pass still open at t_end overlaps the window boundary — discard it.
 
     Ok(passes)
 }
