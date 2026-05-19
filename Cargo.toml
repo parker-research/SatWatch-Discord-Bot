@@ -12,7 +12,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 satkit = "0.16"
 
 # HTTP client (async) for SatNOGS API
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
