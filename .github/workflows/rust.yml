@@ -41,7 +41,7 @@ jobs:
 
       # ---------- Lint ----------
       - name: Clippy
-        run: cargo clippy --all-features --all-targets -- -D warnings
+        run: cargo clippy --all-features --all-targets -- -D warnings --no-deps
 
       # ---------- Test ----------
       - name: Run tests
