@@ -7,7 +7,7 @@ use serenity::all::{
     ChannelId, Command, CommandDataOption, CommandDataOptionValue, CommandInteraction,
     CommandOptionType, CreateCommand, CreateCommandOption, CreateInteractionResponse,
     CreateInteractionResponseFollowup, CreateInteractionResponseMessage, CreateMessage,
-    EditInteractionResponse, GuildId, Interaction,
+    EditInteractionResponse, EditMessage, GuildId, Interaction, MessageId,
 };
 use serenity::async_trait;
 use serenity::http::Http;
@@ -46,10 +46,6 @@ impl TypeMapKey for HttpKey {
 // Pass line formatting
 // ---------------------------------------------------------------------------
 
-/// Render one pass as a single Discord prose line (timing + elevation only).
-///
-/// Discord renders `<t:UNIX:f>` as localised date+time and `<t:UNIX:t>` as
-/// time-only, both in the viewer's own timezone.
 fn format_pass_line(p: &Pass) -> String {
     format!(
         "<t:{aos}:D> **<t:{aos}:t> → <t:{los}:t>** _({dur_m}m{dur_s:02}s, Peak El **{elev:.1}°**)_",
@@ -61,66 +57,12 @@ fn format_pass_line(p: &Pass) -> String {
     )
 }
 
-/// Render all passes for one satellite × ground-station pair as a single Discord
-/// message block.  When `tle` is `Some`, the TLE update timestamp and raw lines
-/// are appended as a footer (used for both /upcoming-passes and new-TLE alerts).
-fn render_pass_group(
-    name: &str,
-    norad_id: u64,
-    station: &str,
-    passes: &[&Pass],
-    min_elev: f64,
-    char_limit: usize,
-    tle: &satnogs::TleInfo,
-) -> String {
-    const FOOTER_RESERVE: usize = 60;
-
-    let header = format!("🛰️ **{name}** (NORAD {norad_id}) @ **{station}**\n");
-
-    if passes.is_empty() {
-        return format!("{header}No passes above {min_elev:.1}° in the search window.");
-    }
-
-    let count_line = format!(
-        "**{}** pass{} above {min_elev:.1}° in the next {CHECK_HOURS}h.\n",
-        passes.len(),
-        if passes.len() != 1 { "es" } else { "" }
-    );
-
-    let mut rendered: Vec<String> = Vec::new();
-    for (i, pass) in passes.iter().enumerate() {
-        if i > 0 && pass.aos_utc - passes[i - 1].los_utc > chrono::Duration::hours(3) {
-            rendered.push(String::new());
-        }
-        rendered.push(format_pass_line(pass));
-    }
-
-    // Reserve extra space for the TLE footer if we'll be appending one.
-    let footer = format_tle_footer(tle);
-
-    let mut out = format!("{header}{count_line}\n");
-    let mut included = 0;
-
-    for line in &rendered {
-        let projected = out.len() + line.len() + 1 + footer.len() + FOOTER_RESERVE;
-        if projected > char_limit {
-            break;
-        }
-        out.push_str(line);
-        out.push('\n');
-        included += 1;
-    }
-
-    let remaining = rendered.len() - included;
-    if remaining > 0 {
-        out.push_str(&format!(
-            "*…{remaining} more — narrow the window or raise min elev*"
-        ));
-    }
-
-    out.push_str(&footer);
-
-    out
+/// Render a single pass as a self-contained Discord message.
+fn render_single_pass(name: &str, norad_id: u64, station: &str, pass: &Pass) -> String {
+    format!(
+        "🛰️ **{name}** (NORAD {norad_id}) @ **{station}**\n{}",
+        format_pass_line(pass)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -530,21 +472,58 @@ async fn handle_passes(ctx: &Context, command: &CommandInteraction) -> Result<()
     })
     .await??;
 
-    // ── Build reply ──────────────────────────────────────────────────────────
-    let pass_refs: Vec<&Pass> = passes.iter().collect();
-    let reply = render_pass_group(
-        &tle_info.name,
-        norad_id,
-        &station_name,
-        &pass_refs,
-        min_elev,
-        2000,
-        &tle_info.clone(),
-    );
+    if passes.is_empty() {
+        command
+            .edit_response(
+                &ctx.http,
+                EditInteractionResponse::new().content(format!(
+                    "🛰️ **{}** (NORAD {norad_id}) @ **{station_name}**\nNo passes above {min_elev:.1}° in the next {hours}h.",
+                    tle_info.name
+                )),
+            )
+            .await?;
+        return Ok(());
+    }
 
-    command
-        .edit_response(&ctx.http, EditInteractionResponse::new().content(&reply))
+    let channel_id = command.channel_id.get();
+    let db = get_db(ctx).await;
+
+    // First pass: edit the deferred placeholder.
+    let first_content = render_single_pass(&tle_info.name, norad_id, &station_name, &passes[0]);
+    let first_msg = command
+        .edit_response(
+            &ctx.http,
+            EditInteractionResponse::new().content(&first_content),
+        )
         .await?;
+    {
+        let db2 = db.clone();
+        let c = first_content.clone();
+        let los = passes[0].los_utc.timestamp();
+        let mid = first_msg.id.get();
+        tokio::task::spawn_blocking(move || db2.save_pass_message(channel_id, mid, los, &c))
+            .await??;
+    }
+
+    // Remaining passes: one followup each.
+    for pass in passes.iter().skip(1) {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let content = render_single_pass(&tle_info.name, norad_id, &station_name, pass);
+        let followup = command
+            .create_followup(
+                &ctx.http,
+                CreateInteractionResponseFollowup::new().content(&content),
+            )
+            .await?;
+        {
+            let db2 = db.clone();
+            let c = content.clone();
+            let los = pass.los_utc.timestamp();
+            let mid = followup.id.get();
+            tokio::task::spawn_blocking(move || db2.save_pass_message(channel_id, mid, los, &c))
+                .await??;
+        }
+    }
 
     Ok(())
 }
@@ -887,7 +866,7 @@ async fn handle_upcoming_passes(ctx: &Context, command: &CommandInteraction) -> 
 
     // Fetch TLEs and compute passes for every satellite, then merge and sort.
     // Does NOT touch the notified_passes table.
-    let mut all_passes: Vec<(String, u64, Pass, satnogs::TleInfo)> = Vec::new();
+    let mut all_passes: Vec<(String, u64, Pass)> = Vec::new(); // (display_name, norad_id, pass)
 
     for sat in &satellites {
         let tle_info = match satnogs::fetch_tle(sat.norad_id).await {
@@ -926,27 +905,14 @@ async fn handle_upcoming_passes(ctx: &Context, command: &CommandInteraction) -> 
         };
 
         for pass in passes {
-            all_passes.push((display_name.clone(), norad_id, pass, tle_info.clone()));
+            all_passes.push((display_name.clone(), norad_id, pass));
         }
     }
 
     // Sort all passes chronologically by AOS across all satellites and stations.
-    all_passes.sort_by_key(|(_, _, pass, _)| pass.aos_utc);
+    all_passes.sort_by_key(|(_, _, pass)| pass.aos_utc);
 
-    // Group by (sat_name, norad_id, station_name), preserving AOS order within each group.
-    let mut groups: Vec<(String, u64, String, Vec<usize>)> = Vec::new();
-    for (i, (name, norad_id, pass, _)) in all_passes.iter().enumerate() {
-        match groups
-            .iter()
-            .position(|(n, nid, s, _tle)| n == name && nid == norad_id && s == &pass.station_name)
-        {
-            Some(idx) => groups[idx].3.push(i),
-            None => groups.push((name.clone(), *norad_id, pass.station_name.clone(), vec![i])),
-        }
-    }
-
-    // ── Build reply ──────────────────────────────────────────────────────────
-    if groups.is_empty() {
+    if all_passes.is_empty() {
         command
             .edit_response(
                 &ctx.http,
@@ -959,34 +925,44 @@ async fn handle_upcoming_passes(ctx: &Context, command: &CommandInteraction) -> 
         return Ok(());
     }
 
-    // Edit the deferred reply with the first group; follow-up for the rest.
-    let mut first = true;
-    for (name, norad_id, station, indices) in &groups {
-        let pass_refs: Vec<&Pass> = indices.iter().map(|&i| &all_passes[i].2).collect();
-        let tle_info = &all_passes[indices[0]].3; // All same TLE, take first.
+    let channel_id = command.channel_id.get();
+    let db = get_db(ctx).await;
 
-        let msg = render_pass_group(
-            name,
-            *norad_id,
-            station,
-            &pass_refs,
-            CHECK_MIN_ELEV_DEG,
-            2000,
-            tle_info,
-        );
-        if first {
-            command
-                .edit_response(&ctx.http, EditInteractionResponse::new().content(&msg))
-                .await?;
-            first = false;
-        } else {
-            command
-                .create_followup(
-                    &ctx.http,
-                    CreateInteractionResponseFollowup::new().content(msg),
-                )
-                .await?;
-            tokio::time::sleep(Duration::from_millis(300)).await;
+    // First pass: edit the deferred placeholder.
+    let (first_name, first_norad, first_pass) = &all_passes[0];
+    let first_content = render_single_pass(first_name, *first_norad, &first_pass.station_name, first_pass);
+    let first_msg = command
+        .edit_response(
+            &ctx.http,
+            EditInteractionResponse::new().content(&first_content),
+        )
+        .await?;
+    {
+        let db2 = db.clone();
+        let c = first_content.clone();
+        let los = first_pass.los_utc.timestamp();
+        let mid = first_msg.id.get();
+        tokio::task::spawn_blocking(move || db2.save_pass_message(channel_id, mid, los, &c))
+            .await??;
+    }
+
+    // Remaining passes: one followup each.
+    for (name, norad_id, pass) in all_passes.iter().skip(1) {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let content = render_single_pass(name, *norad_id, &pass.station_name, pass);
+        let followup = command
+            .create_followup(
+                &ctx.http,
+                CreateInteractionResponseFollowup::new().content(&content),
+            )
+            .await?;
+        {
+            let db2 = db.clone();
+            let c = content.clone();
+            let los = pass.los_utc.timestamp();
+            let mid = followup.id.get();
+            tokio::task::spawn_blocking(move || db2.save_pass_message(channel_id, mid, los, &c))
+                .await??;
         }
     }
 
@@ -994,25 +970,55 @@ async fn handle_upcoming_passes(ctx: &Context, command: &CommandInteraction) -> 
 }
 
 // ---------------------------------------------------------------------------
-// TLE footer formatting
+// Background strikethrough editor
 // ---------------------------------------------------------------------------
 
-/// Render the TLE footer appended to every new-TLE pass notification.
-/// Includes the SatNOGS update timestamp as a Discord localised datetime
-/// (`<t:UNIX:f>`) and the raw TLE lines in a code block.
-fn format_tle_footer(tle: &satnogs::TleInfo) -> String {
-    let ts_str = chrono::DateTime::parse_from_str(&tle.updated, "%Y-%m-%dT%H:%M:%S%.f%z")
-        .map(|dt| {
-            let unix = dt.timestamp();
-            // <t:UNIX:f> = localised full date+time, <t:UNIX:R> = relative ("3 minutes ago")
-            format!("<t:{unix}:f> (<t:{unix}:R>)")
-        })
-        .unwrap_or_else(|_| tle.updated.clone());
+/// Edit every tracked pass message whose LOS has passed, replacing the content
+/// with a struck-through version.  Called by the background task in main.rs.
+pub async fn run_strikethrough_check(http: &Http, db: &Arc<Database>) -> Result<usize> {
+    let now_unix = chrono::Utc::now().timestamp();
 
-    format!(
-        "\nTLE Updated: {ts_str}\n```\n{}\n{}\n```",
-        tle.line1, tle.line2
-    )
+    let expired = {
+        let db2 = db.clone();
+        tokio::task::spawn_blocking(move || db2.get_expired_pass_messages(now_unix)).await??
+    };
+
+    let mut count = 0;
+    for msg_info in &expired {
+        let channel = ChannelId::new(msg_info.channel_id);
+        let message_id = MessageId::new(msg_info.message_id);
+        let struck_content = format!("~~{}~~", msg_info.content);
+
+        let edit_ok = match channel
+            .edit_message(http, message_id, EditMessage::new().content(&struck_content))
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                error!(
+                    "Failed to strike through message {} in channel {}: {e:#}",
+                    msg_info.message_id, msg_info.channel_id
+                );
+                false
+            }
+        };
+
+        // Mark struck regardless of edit success to avoid infinite retries.
+        if edit_ok {
+            count += 1;
+        }
+        let db2 = db.clone();
+        let id = msg_info.id;
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || db2.mark_pass_message_struck(id)).await?
+        {
+            error!("Failed to mark pass message {id} as struck in DB: {e:#}");
+        }
+
+        tokio::time::sleep(SHORT_DELAY_DEBOUCE_DURATION).await;
+    }
+
+    Ok(count)
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,36 +1142,28 @@ pub async fn run_new_tle_check(http: &Http, db: &Arc<Database>) -> Result<usize>
                 }
             };
 
-            // Group passes by station.
-            let mut by_station: Vec<(String, Vec<usize>)> = Vec::new();
-            for (i, pass) in passes.iter().enumerate() {
-                let station = pass.station_name.clone();
-                match by_station.iter().position(|(s, _)| s == &station) {
-                    Some(idx) => by_station[idx].1.push(i),
-                    None => by_station.push((station, vec![i])),
-                }
-            }
-
-            // Send one message per sat×station group, with TLE footer appended.
-            for (station, indices) in &by_station {
-                let pass_refs: Vec<&Pass> = indices.iter().map(|&i| &passes[i]).collect();
-                let msg = render_pass_group(
-                    &display_name,
-                    norad_id,
-                    station,
-                    &pass_refs,
-                    CHECK_MIN_ELEV_DEG,
-                    1800,
-                    &tle,
-                );
-
+            // Send one message per individual pass.
+            for pass in &passes {
+                let content = render_single_pass(&display_name, norad_id, &pass.station_name, pass);
                 match channel_id
-                    .send_message(http, CreateMessage::new().content(msg))
+                    .send_message(http, CreateMessage::new().content(&content))
                     .await
                 {
-                    Ok(_) => {
-                        announced_count += indices.len();
+                    Ok(msg) => {
+                        announced_count += 1;
                         announced_subscriptions.insert(sub_id);
+                        let db2 = db.clone();
+                        let c = content.clone();
+                        let los = pass.los_utc.timestamp();
+                        let cid = channel_id.get();
+                        let mid = msg.id.get();
+                        if let Err(e) = tokio::task::spawn_blocking(move || {
+                            db2.save_pass_message(cid, mid, los, &c)
+                        })
+                        .await?
+                        {
+                            error!("Failed to save pass message to DB: {e:#}");
+                        }
                     }
                     Err(e) => {
                         error!("Failed to send pass notification to channel {channel_id}: {e:#}");

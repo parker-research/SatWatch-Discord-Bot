@@ -7,7 +7,7 @@ mod passes;
 mod satnogs;
 
 use db::Database;
-use discord_interactions::{DatabaseKey, Handler, HttpKey, run_new_tle_check};
+use discord_interactions::{DatabaseKey, Handler, HttpKey, run_new_tle_check, run_strikethrough_check};
 
 use anyhow::Result;
 use serenity::all::GatewayIntents;
@@ -18,6 +18,7 @@ use std::time::Duration;
 use tracing::{error, info};
 
 const NEW_TLE_POLLING_INTERVAL: Duration = Duration::from_secs(300);
+const STRIKETHROUGH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -70,6 +71,30 @@ async fn main() -> Result<()> {
                 Err(e) => error!("New TLE check error: {e:#}"),
             }
             tokio::time::sleep(NEW_TLE_POLLING_INTERVAL).await;
+        }
+    });
+
+    // Background strikethrough loop.
+    // Edits pass messages to add strikethrough once LOS has passed.
+    let data_handle2 = client.data.clone();
+    let db_bg2 = db.clone();
+    tokio::spawn(async move {
+        let http = loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let data = data_handle2.read().await;
+            if let Some(h) = data.get::<HttpKey>() {
+                break h.clone();
+            }
+        };
+        info!("Background strikethrough checker started");
+
+        loop {
+            match run_strikethrough_check(&http, &db_bg2).await {
+                Ok(0) => {}
+                Ok(n) => info!("Strikethrough check: struck out {n} expired pass message(s)"),
+                Err(e) => error!("Strikethrough check error: {e:#}"),
+            }
+            tokio::time::sleep(STRIKETHROUGH_CHECK_INTERVAL).await;
         }
     });
 

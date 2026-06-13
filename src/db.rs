@@ -27,13 +27,20 @@ pub struct Subscription {
     pub channel_id: u64,
 }
 
+pub struct PassMessage {
+    pub id: i64,
+    pub channel_id: u64,
+    pub message_id: u64,
+    pub content: String,
+}
+
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
 
 /// Bump this whenever the schema changes.
 #[allow(dead_code)]
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Full rebuild for any version < 2.  Creates the V2 schema (still includes
 /// notified_passes; the V3 migration immediately replaces it on the same open).
@@ -108,6 +115,20 @@ const MIGRATION_V3_SQL: &str = "
     UPDATE schema_version SET version = 3;
 ";
 
+/// V3 → V4: add pass_messages table for per-pass Discord message tracking.
+const MIGRATION_V4_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS pass_messages (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_id  INTEGER NOT NULL,
+        message_id  INTEGER NOT NULL,
+        los_unix    INTEGER NOT NULL,
+        content     TEXT    NOT NULL,
+        struck      INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(channel_id, message_id)
+    );
+    UPDATE schema_version SET version = 4;
+";
+
 // ---------------------------------------------------------------------------
 // Database
 // ---------------------------------------------------------------------------
@@ -133,6 +154,9 @@ impl Database {
         }
         if version < 3 {
             conn.execute_batch(MIGRATION_V3_SQL)?;
+        }
+        if version < 4 {
+            conn.execute_batch(MIGRATION_V4_SQL)?;
         }
 
         Ok(Self {
@@ -352,6 +376,63 @@ impl Database {
                 tle_line1,
                 tle_line2
             ],
+        )?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Pass message tracking (for strikethrough edits)
+    // -----------------------------------------------------------------------
+
+    /// Record a Discord message that displays a single pass, so we can edit it
+    /// later to add strikethrough once the pass has ended.
+    pub fn save_pass_message(
+        &self,
+        channel_id: u64,
+        message_id: u64,
+        los_unix: i64,
+        content: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO pass_messages (channel_id, message_id, los_unix, content)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![channel_id as i64, message_id as i64, los_unix, content],
+        )?;
+        Ok(())
+    }
+
+    /// Return all pass messages whose LOS has already passed and that have not
+    /// yet been struck through.
+    pub fn get_expired_pass_messages(&self, now_unix: i64) -> Result<Vec<PassMessage>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, channel_id, message_id, content
+             FROM pass_messages
+             WHERE struck = 0 AND los_unix <= ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![now_unix], |row| {
+                let channel_id: i64 = row.get(1)?;
+                let message_id: i64 = row.get(2)?;
+                Ok(PassMessage {
+                    id: row.get(0)?,
+                    channel_id: channel_id as u64,
+                    message_id: message_id as u64,
+                    content: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Mark a pass message as struck through so the background checker won't
+    /// try to edit it again.
+    pub fn mark_pass_message_struck(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE pass_messages SET struck = 1 WHERE id = ?1",
+            params![id],
         )?;
         Ok(())
     }
