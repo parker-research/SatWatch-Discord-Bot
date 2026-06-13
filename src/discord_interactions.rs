@@ -1037,7 +1037,11 @@ pub async fn run_strikethrough_check(http: &Http, db: &Arc<Database>) -> Result<
         let struck_content = strike_pass_lines(&msg_info.content);
 
         let edit_ok = match channel
-            .edit_message(http, message_id, EditMessage::new().content(&struck_content))
+            .edit_message(
+                http,
+                message_id,
+                EditMessage::new().content(&struck_content),
+            )
             .await
         {
             Ok(_) => true,

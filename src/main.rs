@@ -7,7 +7,9 @@ mod passes;
 mod satnogs;
 
 use db::Database;
-use discord_interactions::{DatabaseKey, Handler, HttpKey, run_new_tle_check, run_strikethrough_check};
+use discord_interactions::{
+    DatabaseKey, Handler, HttpKey, run_new_tle_check, run_strikethrough_check,
+};
 
 use anyhow::Result;
 use serenity::all::GatewayIntents;
