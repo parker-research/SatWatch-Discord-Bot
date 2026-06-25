@@ -25,11 +25,11 @@ const CHECK_MIN_ELEV_DEG: f64 = 5.0;
 /// Search window for the background fresh TLE checker.
 const CHECK_HOURS: f64 = 48.0;
 
-/// Extra hours searched beyond CHECK_HOURS so that passes belonging to a 3h
-/// group whose first member is inside the notification window are always sent
-/// together in the same run, not trickled in over successive polling cycles.
-/// 6h covers chains of three consecutive passes (each gap ≤ 3h).
-const GROUP_LOOKAHEAD_HOURS: f64 = 6.0;
+/// Extra hours searched beyond CHECK_HOURS to ensure a pass whose AOS is right
+/// at the 48h boundary has its full duration captured (LOS may extend a few
+/// minutes beyond it).  Also guarantees all group members are found in the
+/// search results when the group is finally ready to send.
+const GROUP_SEARCH_BUFFER_HOURS: f64 = 6.0;
 
 const SHORT_DELAY_DEBOUCE_DURATION: Duration = Duration::from_millis(500);
 
@@ -1194,8 +1194,8 @@ pub async fn run_new_tle_check(http: &Http, db: &Arc<Database>) -> Result<usize>
 
             let display_name = sat.label.as_deref().unwrap_or(&tle.name).to_string();
 
-            // Search the extended window so that passes beyond 48h that belong
-            // to the same 3h group as a within-window pass are included.
+            // Search a slightly extended window so that even a pass whose AOS
+            // falls right at the 48h boundary has its full duration captured.
             let tle2 = tle.clone();
             let stations2 = stations.clone();
             let all_passes = match tokio::task::spawn_blocking(move || {
@@ -1203,7 +1203,7 @@ pub async fn run_new_tle_check(http: &Http, db: &Arc<Database>) -> Result<usize>
                     &tle2.line1,
                     &tle2.line2,
                     &stations2,
-                    CHECK_HOURS + GROUP_LOOKAHEAD_HOURS,
+                    CHECK_HOURS + GROUP_SEARCH_BUFFER_HOURS,
                     CHECK_MIN_ELEV_DEG,
                 )
             })
@@ -1234,10 +1234,12 @@ pub async fn run_new_tle_check(http: &Http, db: &Arc<Database>) -> Result<usize>
 
             for (station, station_passes) in &by_station {
                 for group in group_by_3h(station_passes) {
-                    // Only process groups whose first pass has entered the
-                    // notification window.  Lookahead-only groups are skipped
-                    // here and picked up in a later polling cycle.
-                    if (group[0].aos_utc.timestamp() as f64) > window_end_unix {
+                    // Only send a group once ALL of its passes are within the
+                    // 48h notification window.  Checking the last pass ensures
+                    // the whole group is sent together in a single cycle rather
+                    // than trickling in one-by-one as each pass crosses the
+                    // boundary.
+                    if (group.last().unwrap().aos_utc.timestamp() as f64) > window_end_unix {
                         continue;
                     }
 
