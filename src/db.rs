@@ -416,6 +416,7 @@ impl Database {
     /// by the background task to match and edit messages when TLEs change.
     /// Pass `None` for all three when saving ad-hoc slash-command messages that
     /// have no subscription context (they will still be struck through later).
+    #[allow(clippy::too_many_arguments)]
     pub fn save_pass_message(
         &self,
         subscription_id: Option<i64>,
@@ -466,7 +467,13 @@ impl Database {
                    AND struck = 0
                  ORDER BY ABS(aos_unix - ?4) ASC
                  LIMIT 1",
-                params![subscription_id, norad_id as i64, station, aos_unix, tolerance_secs],
+                params![
+                    subscription_id,
+                    norad_id as i64,
+                    station,
+                    aos_unix,
+                    tolerance_secs
+                ],
                 |row| {
                     let channel_id: i64 = row.get(1)?;
                     let message_id: i64 = row.get(2)?;

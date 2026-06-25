@@ -3,6 +3,7 @@ use crate::passes::{GroundStation, Pass, find_passes};
 use crate::satnogs;
 
 use anyhow::{Result, anyhow};
+use std::collections::HashMap;
 use serenity::all::{
     ChannelId, Command, CommandDataOption, CommandDataOptionValue, CommandInteraction,
     CommandOptionType, CreateCommand, CreateCommandOption, CreateInteractionResponse,
@@ -64,6 +65,12 @@ fn render_pass_group_msg(name: &str, norad_id: u64, station: &str, passes: &[Pas
     format!("{header}\n{}", lines.join("\n"))
 }
 
+/// Render a single pass without the satellite/station header.
+/// Used for passes that are not the first in their 3h group.
+fn render_pass_no_header(pass: &Pass) -> String {
+    format_pass_line(pass)
+}
+
 /// Split a pre-sorted-by-AOS pass slice into groups where consecutive passes
 /// have no more than 3 hours between LOS and the next AOS.
 fn group_by_3h(passes: &[Pass]) -> Vec<Vec<Pass>> {
@@ -81,13 +88,16 @@ fn group_by_3h(passes: &[Pass]) -> Vec<Vec<Pass>> {
     groups
 }
 
-/// Strike through only the pass lines in a group message, leaving the
-/// satellite/station header (first line) untouched.
+/// Strike through pass content, preserving the satellite/station header if present.
+/// Messages without a header (not the first in their group) are struck entirely.
 fn strike_pass_lines(content: &str) -> String {
-    match content.find('\n') {
-        Some(pos) => format!("{}\n~~{}~~", &content[..pos], &content[pos + 1..]),
-        None => content.to_string(),
+    if let Some(pos) = content.find('\n') {
+        let first_line = &content[..pos];
+        if first_line.contains("🛰️") {
+            return format!("{first_line}\n~~{}~~", &content[pos + 1..]);
+        }
     }
+    format!("~~{content}~~")
 }
 
 // ---------------------------------------------------------------------------
@@ -1259,17 +1269,33 @@ pub async fn run_new_tle_check(http: &Http, db: &Arc<Database>) -> Result<usize>
         // chronologically and group members appear back-to-back.
         new_pass_specs.sort_by_key(|(_, _, p)| p.aos_utc);
 
+        // Determine which passes lead a 3h group (show header) vs. follow one (no header).
+        // Track the last LOS per (norad_id, station) pair independently.
+        let mut last_los_by_key: HashMap<(u64, String), i64> = HashMap::new();
+        let is_leader: Vec<bool> = new_pass_specs
+            .iter()
+            .map(|(_, norad_id, pass)| {
+                let key = (*norad_id, pass.station_name.clone());
+                let prev_los = last_los_by_key.get(&key).copied();
+                let gap_secs = prev_los
+                    .map(|los| pass.aos_utc.timestamp() - los)
+                    .unwrap_or(i64::MAX);
+                let leader = gap_secs > 3 * 3600;
+                last_los_by_key.insert(key, pass.los_utc.timestamp());
+                leader
+            })
+            .collect();
+
         let cid = channel_id.get();
-        for (name, norad_id, pass) in &new_pass_specs {
+        for ((name, norad_id, pass), leader) in new_pass_specs.iter().zip(is_leader.iter()) {
             // Copy primitive values out of the iterator reference so the
             // spawn_blocking closure can be 'static.
             let norad_id: u64 = *norad_id;
-            let content = render_pass_group_msg(
-                name,
-                norad_id,
-                &pass.station_name,
-                std::slice::from_ref(pass),
-            );
+            let content = if *leader {
+                render_pass_group_msg(name, norad_id, &pass.station_name, std::slice::from_ref(pass))
+            } else {
+                render_pass_no_header(pass)
+            };
             let aos = pass.aos_utc.timestamp();
             let los = pass.los_utc.timestamp();
             let station = pass.station_name.clone();
