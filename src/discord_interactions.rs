@@ -25,6 +25,12 @@ const CHECK_MIN_ELEV_DEG: f64 = 5.0;
 /// Search window for the background fresh TLE checker.
 const CHECK_HOURS: f64 = 48.0;
 
+/// Extra hours searched beyond CHECK_HOURS so that passes belonging to a 3h
+/// group whose first member is inside the notification window are always sent
+/// together in the same run, not trickled in over successive polling cycles.
+/// 6h covers chains of three consecutive passes (each gap ≤ 3h).
+const GROUP_LOOKAHEAD_HOURS: f64 = 6.0;
+
 const SHORT_DELAY_DEBOUCE_DURATION: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
@@ -1122,6 +1128,10 @@ pub async fn run_new_tle_check(http: &Http, db: &Arc<Database>) -> Result<usize>
         return Ok(0);
     }
 
+    // Passes whose AOS is beyond this threshold are in the lookahead zone; they
+    // are queued for sending only when their group-leader is inside the window.
+    let window_end_unix = (chrono::Utc::now().timestamp() as f64) + CHECK_HOURS * 3600.0;
+
     let mut total_new = 0_usize;
 
     for sub in &subscriptions {
@@ -1184,14 +1194,16 @@ pub async fn run_new_tle_check(http: &Http, db: &Arc<Database>) -> Result<usize>
 
             let display_name = sat.label.as_deref().unwrap_or(&tle.name).to_string();
 
+            // Search the extended window so that passes beyond 48h that belong
+            // to the same 3h group as a within-window pass are included.
             let tle2 = tle.clone();
             let stations2 = stations.clone();
-            let passes = match tokio::task::spawn_blocking(move || {
+            let all_passes = match tokio::task::spawn_blocking(move || {
                 find_passes(
                     &tle2.line1,
                     &tle2.line2,
                     &stations2,
-                    CHECK_HOURS,
+                    CHECK_HOURS + GROUP_LOOKAHEAD_HOURS,
                     CHECK_MIN_ELEV_DEG,
                 )
             })
@@ -1210,64 +1222,96 @@ pub async fn run_new_tle_check(http: &Http, db: &Arc<Database>) -> Result<usize>
                 }
             };
 
-            for pass in &passes {
-                let aos = pass.aos_utc.timestamp();
-                let los = pass.los_utc.timestamp();
-                let station = pass.station_name.clone();
+            // Split passes by station so group_by_3h operates within a single
+            // satellite+station pair (mixing stations would corrupt grouping).
+            let mut by_station: HashMap<String, Vec<Pass>> = HashMap::new();
+            for pass in all_passes {
+                by_station
+                    .entry(pass.station_name.clone())
+                    .or_default()
+                    .push(pass);
+            }
 
-                let existing = {
-                    let db2 = db.clone();
-                    let station2 = station.clone();
-                    tokio::task::spawn_blocking(move || {
-                        db2.find_pass_message_near_aos(sub_id, norad_id, &station2, aos, 300)
-                    })
-                    .await??
-                };
-
-                match existing {
-                    None => {
-                        // Pass has no message yet — queue it to send.
-                        new_pass_specs.push((display_name.clone(), norad_id, pass.clone()));
+            for (station, station_passes) in &by_station {
+                for group in group_by_3h(station_passes) {
+                    // Only process groups whose first pass has entered the
+                    // notification window.  Lookahead-only groups are skipped
+                    // here and picked up in a later polling cycle.
+                    if (group[0].aos_utc.timestamp() as f64) > window_end_unix {
+                        continue;
                     }
-                    Some(msg) if tle_changed => {
-                        // TLE changed — re-render and edit if content differs.
-                        let content = render_pass_group_msg(
-                            &display_name,
-                            norad_id,
-                            &station,
-                            std::slice::from_ref(pass),
-                        );
-                        if msg.content != content {
-                            let ch = ChannelId::new(msg.channel_id);
-                            let mid = MessageId::new(msg.message_id);
-                            match ch
-                                .edit_message(http, mid, EditMessage::new().content(&content))
-                                .await
-                            {
-                                Ok(_) => {
-                                    let db2 = db.clone();
-                                    let c = content.clone();
-                                    let id = msg.id;
-                                    if let Err(e) = tokio::task::spawn_blocking(move || {
-                                        db2.update_pass_message_content(id, aos, los, &c)
-                                    })
-                                    .await?
+
+                    for pass in &group {
+                        let aos = pass.aos_utc.timestamp();
+                        let los = pass.los_utc.timestamp();
+
+                        let existing = {
+                            let db2 = db.clone();
+                            let station2 = station.clone();
+                            tokio::task::spawn_blocking(move || {
+                                db2.find_pass_message_near_aos(
+                                    sub_id, norad_id, &station2, aos, 300,
+                                )
+                            })
+                            .await??
+                        };
+
+                        match existing {
+                            None => {
+                                // No message yet — queue this pass (may be beyond
+                                // 48h but its group-leader is inside the window).
+                                new_pass_specs.push((display_name.clone(), norad_id, pass.clone()));
+                            }
+                            Some(msg) if tle_changed => {
+                                // TLE changed — re-render and edit if content differs.
+                                let content = render_pass_group_msg(
+                                    &display_name,
+                                    norad_id,
+                                    station,
+                                    std::slice::from_ref(pass),
+                                );
+                                if msg.content != content {
+                                    let ch = ChannelId::new(msg.channel_id);
+                                    let mid = MessageId::new(msg.message_id);
+                                    match ch
+                                        .edit_message(
+                                            http,
+                                            mid,
+                                            EditMessage::new().content(&content),
+                                        )
+                                        .await
                                     {
-                                        error!("Failed to update pass message in DB: {e:#}");
+                                        Ok(_) => {
+                                            let db2 = db.clone();
+                                            let c = content.clone();
+                                            let id = msg.id;
+                                            if let Err(e) = tokio::task::spawn_blocking(move || {
+                                                db2.update_pass_message_content(id, aos, los, &c)
+                                            })
+                                            .await?
+                                            {
+                                                error!(
+                                                    "Failed to update pass message in DB: {e:#}"
+                                                );
+                                            }
+                                            debug!(
+                                                "Edited pass message {} for NORAD {norad_id} @ {station}",
+                                                msg.message_id
+                                            );
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Failed to edit pass message {}: {e:#}",
+                                                msg.message_id
+                                            );
+                                        }
                                     }
-                                    debug!(
-                                        "Edited pass message {} for NORAD {norad_id} @ {station}",
-                                        msg.message_id
-                                    );
-                                }
-                                Err(e) => {
-                                    error!("Failed to edit pass message {}: {e:#}", msg.message_id);
+                                    tokio::time::sleep(SHORT_DELAY_DEBOUCE_DURATION).await;
                                 }
                             }
-                            tokio::time::sleep(SHORT_DELAY_DEBOUCE_DURATION).await;
+                            _ => {} // Message exists and TLE unchanged — nothing to do.
                         }
                     }
-                    _ => {} // Message exists and TLE unchanged — nothing to do.
                 }
             }
 
