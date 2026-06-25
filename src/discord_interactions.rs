@@ -3,7 +3,6 @@ use crate::passes::{GroundStation, Pass, find_passes};
 use crate::satnogs;
 
 use anyhow::{Result, anyhow};
-use std::collections::HashMap;
 use serenity::all::{
     ChannelId, Command, CommandDataOption, CommandDataOptionValue, CommandInteraction,
     CommandOptionType, CreateCommand, CreateCommandOption, CreateInteractionResponse,
@@ -14,6 +13,7 @@ use serenity::async_trait;
 use serenity::http::Http;
 use serenity::model::gateway::Ready;
 use serenity::prelude::*;
+use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1150,7 +1150,10 @@ pub async fn run_new_tle_check(http: &Http, db: &Arc<Database>) -> Result<usize>
             let tle = match satnogs::fetch_tle(norad_id).await {
                 Ok(t) => t,
                 Err(e) => {
-                    warn!("Failed to fetch TLE for NORAD {} (sub {}): {e:#}", norad_id, sub_id);
+                    warn!(
+                        "Failed to fetch TLE for NORAD {} (sub {}): {e:#}",
+                        norad_id, sub_id
+                    );
                     tokio::time::sleep(SHORT_DELAY_DEBOUCE_DURATION).await;
                     continue;
                 }
@@ -1165,7 +1168,10 @@ pub async fn run_new_tle_check(http: &Http, db: &Arc<Database>) -> Result<usize>
             let tle_changed = cached_updated.as_deref() != Some(tle.updated.as_str());
 
             if tle_changed {
-                info!("New TLE for NORAD {norad_id} (sub {sub_id}): updated {}", tle.updated);
+                info!(
+                    "New TLE for NORAD {norad_id} (sub {sub_id}): updated {}",
+                    tle.updated
+                );
                 let db2 = db.clone();
                 let updated = tle.updated.clone();
                 let line1 = tle.line1.clone();
@@ -1181,7 +1187,13 @@ pub async fn run_new_tle_check(http: &Http, db: &Arc<Database>) -> Result<usize>
             let tle2 = tle.clone();
             let stations2 = stations.clone();
             let passes = match tokio::task::spawn_blocking(move || {
-                find_passes(&tle2.line1, &tle2.line2, &stations2, CHECK_HOURS, CHECK_MIN_ELEV_DEG)
+                find_passes(
+                    &tle2.line1,
+                    &tle2.line2,
+                    &stations2,
+                    CHECK_HOURS,
+                    CHECK_MIN_ELEV_DEG,
+                )
             })
             .await
             {
@@ -1249,10 +1261,7 @@ pub async fn run_new_tle_check(http: &Http, db: &Arc<Database>) -> Result<usize>
                                     );
                                 }
                                 Err(e) => {
-                                    error!(
-                                        "Failed to edit pass message {}: {e:#}",
-                                        msg.message_id
-                                    );
+                                    error!("Failed to edit pass message {}: {e:#}", msg.message_id);
                                 }
                             }
                             tokio::time::sleep(SHORT_DELAY_DEBOUCE_DURATION).await;
@@ -1292,7 +1301,12 @@ pub async fn run_new_tle_check(http: &Http, db: &Arc<Database>) -> Result<usize>
             // spawn_blocking closure can be 'static.
             let norad_id: u64 = *norad_id;
             let content = if *leader {
-                render_pass_group_msg(name, norad_id, &pass.station_name, std::slice::from_ref(pass))
+                render_pass_group_msg(
+                    name,
+                    norad_id,
+                    &pass.station_name,
+                    std::slice::from_ref(pass),
+                )
             } else {
                 render_pass_no_header(pass)
             };
