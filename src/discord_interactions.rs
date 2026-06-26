@@ -1266,12 +1266,19 @@ pub async fn run_new_tle_check(http: &Http, db: &Arc<Database>) -> Result<usize>
                             }
                             Some(msg) if tle_changed => {
                                 // TLE changed — re-render and edit if content differs.
-                                let content = render_pass_group_msg(
-                                    &display_name,
-                                    norad_id,
-                                    station,
-                                    std::slice::from_ref(pass),
-                                );
+                                // Preserve whether the original message had a header
+                                // (first-in-group messages do; others don't).
+                                let has_header = msg.content.starts_with("🛰️");
+                                let content = if has_header {
+                                    render_pass_group_msg(
+                                        &display_name,
+                                        norad_id,
+                                        station,
+                                        std::slice::from_ref(pass),
+                                    )
+                                } else {
+                                    render_pass_no_header(pass)
+                                };
                                 if msg.content != content {
                                     let ch = ChannelId::new(msg.channel_id);
                                     let mid = MessageId::new(msg.message_id);
