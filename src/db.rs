@@ -40,7 +40,7 @@ pub struct PassMessage {
 
 /// Bump this whenever the schema changes.
 #[allow(dead_code)]
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Full rebuild for any version < 2.  Creates the V2 schema (still includes
 /// notified_passes; the V3 migration immediately replaces it on the same open).
@@ -129,6 +129,29 @@ const MIGRATION_V4_SQL: &str = "
     UPDATE schema_version SET version = 4;
 ";
 
+/// V4 → V5: rebuild pass_messages with pass-identity columns so the background
+/// task can find and edit individual-pass messages when TLEs are updated.
+/// Identity columns (subscription_id, norad_id, station) are nullable to
+/// accommodate ad-hoc slash-command messages that have no subscription context.
+const MIGRATION_V5_SQL: &str = "
+    DROP TABLE IF EXISTS pass_messages;
+    CREATE TABLE pass_messages (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        subscription_id INTEGER REFERENCES subscriptions(id) ON DELETE CASCADE,
+        norad_id        INTEGER,
+        station         TEXT,
+        aos_unix        INTEGER NOT NULL,
+        channel_id      INTEGER NOT NULL,
+        message_id      INTEGER NOT NULL,
+        los_unix        INTEGER NOT NULL,
+        content         TEXT    NOT NULL,
+        struck          INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(subscription_id, norad_id, station, aos_unix),
+        UNIQUE(channel_id, message_id)
+    );
+    UPDATE schema_version SET version = 5;
+";
+
 // ---------------------------------------------------------------------------
 // Database
 // ---------------------------------------------------------------------------
@@ -157,6 +180,9 @@ impl Database {
         }
         if version < 4 {
             conn.execute_batch(MIGRATION_V4_SQL)?;
+        }
+        if version < 5 {
+            conn.execute_batch(MIGRATION_V5_SQL)?;
         }
 
         Ok(Self {
@@ -381,13 +407,22 @@ impl Database {
     }
 
     // -----------------------------------------------------------------------
-    // Pass message tracking (for strikethrough edits)
+    // Pass message tracking (for strikethrough edits and TLE-update edits)
     // -----------------------------------------------------------------------
 
-    /// Record a Discord message that displays a single pass, so we can edit it
-    /// later to add strikethrough once the pass has ended.
+    /// Record a Discord message that displays a single pass.
+    ///
+    /// `subscription_id`, `norad_id`, and `station` are the pass identity used
+    /// by the background task to match and edit messages when TLEs change.
+    /// Pass `None` for all three when saving ad-hoc slash-command messages that
+    /// have no subscription context (they will still be struck through later).
+    #[allow(clippy::too_many_arguments)]
     pub fn save_pass_message(
         &self,
+        subscription_id: Option<i64>,
+        norad_id: Option<u64>,
+        station: Option<&str>,
+        aos_unix: i64,
         channel_id: u64,
         message_id: u64,
         los_unix: i64,
@@ -395,9 +430,76 @@ impl Database {
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR IGNORE INTO pass_messages (channel_id, message_id, los_unix, content)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![channel_id as i64, message_id as i64, los_unix, content],
+            "INSERT OR IGNORE INTO pass_messages
+             (subscription_id, norad_id, station, aos_unix, channel_id, message_id, los_unix, content)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                subscription_id,
+                norad_id.map(|id| id as i64),
+                station,
+                aos_unix,
+                channel_id as i64,
+                message_id as i64,
+                los_unix,
+                content
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Find a non-struck pass message by pass identity, matching AOS within
+    /// `tolerance_secs` seconds.  Returns the closest match, or `None`.
+    pub fn find_pass_message_near_aos(
+        &self,
+        subscription_id: i64,
+        norad_id: u64,
+        station: &str,
+        aos_unix: i64,
+        tolerance_secs: i64,
+    ) -> Result<Option<PassMessage>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT id, channel_id, message_id, content
+                 FROM pass_messages
+                 WHERE subscription_id = ?1 AND norad_id = ?2 AND station = ?3
+                   AND ABS(aos_unix - ?4) <= ?5
+                   AND struck = 0
+                 ORDER BY ABS(aos_unix - ?4) ASC
+                 LIMIT 1",
+                params![
+                    subscription_id,
+                    norad_id as i64,
+                    station,
+                    aos_unix,
+                    tolerance_secs
+                ],
+                |row| {
+                    let channel_id: i64 = row.get(1)?;
+                    let message_id: i64 = row.get(2)?;
+                    Ok(PassMessage {
+                        id: row.get(0)?,
+                        channel_id: channel_id as u64,
+                        message_id: message_id as u64,
+                        content: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Update a pass message's content and timing after a TLE revision shifts the pass.
+    pub fn update_pass_message_content(
+        &self,
+        id: i64,
+        new_aos_unix: i64,
+        new_los_unix: i64,
+        new_content: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE pass_messages SET aos_unix = ?1, los_unix = ?2, content = ?3 WHERE id = ?4",
+            params![new_aos_unix, new_los_unix, new_content, id],
         )?;
         Ok(())
     }
