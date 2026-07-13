@@ -1,0 +1,28 @@
+[Unit]
+Description=SatWatch Discord Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Adjust these two paths/user to match your deployment.
+User=satwatch
+WorkingDirectory=/opt/satwatch-discord-bot
+
+# dotenvy loads .env from the working directory above; keep DISCORD_TOKEN etc there.
+ExecStart=/opt/satwatch-discord-bot/satwatch-discord-bot
+
+Restart=on-failure
+RestartSec=5s
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/satwatch-discord-bot
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
