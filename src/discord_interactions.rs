@@ -20,7 +20,7 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 /// Minimum elevation used by the background fresh TLE checker.
-const CHECK_MIN_ELEV_DEG: f64 = 5.0;
+const CHECK_MIN_ELEV_DEG: f64 = 0.0;
 
 /// Search window for the background fresh TLE checker.
 const CHECK_HOURS: f64 = 48.0;
@@ -221,7 +221,7 @@ fn build_commands() -> Vec<CreateCommand> {
                 CreateCommandOption::new(
                     CommandOptionType::Number,
                     "min_elev",
-                    "Minimum peak elevation in degrees to report (default 5)",
+                    "Minimum peak elevation in degrees to report (default 0)",
                 )
                 .required(false),
             )
@@ -464,7 +464,7 @@ async fn handle_passes(ctx: &Context, command: &CommandInteraction) -> Result<()
     let elevation_m = get_option_f64(command, "elevation_m").unwrap_or(0.0);
     let altitude_m = get_option_f64(command, "altitude_m").unwrap_or(0.0);
     let hours = get_option_i64(command, "hours").unwrap_or(24).clamp(1, 72) as u64;
-    let min_elev = get_option_f64(command, "min_elev").unwrap_or(5.0);
+    let min_elev = get_option_f64(command, "min_elev").unwrap_or(0.0);
     let station_name = get_option_str(command, "station_name")
         .unwrap_or_else(|| format!("{latitude_deg:.2}°N, {longitude_deg:.2}°E"));
 
